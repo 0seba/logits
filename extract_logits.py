@@ -181,8 +181,25 @@ class StreamingHFUploader:
             if col in df.columns:
                 df[col] = df[col].apply(lambda x: list(x) if isinstance(x, np.ndarray) else x)
 
-        # Convert to PyArrow
-        table = pa.Table.from_pandas(df)
+        # Define explicit schema with efficient types
+        schema = pa.schema([
+            ('index', pa.int32()),
+            ('num_tokens', pa.int32()),
+            # Variable-length lists per token
+            ('top_indices', pa.list_(pa.list_(pa.int32()))),
+            ('top_logits_quantized', pa.list_(pa.list_(pa.uint16()))),
+            ('top_min', pa.list_(pa.float32())),
+            ('top_max', pa.list_(pa.float32())),
+            # Fixed-length lists per token
+            ('sampled_indices', pa.list_(pa.list_(pa.int32()))),
+            ('sampled_logits_quantized', pa.list_(pa.list_(pa.uint16()))),
+            ('sampled_min', pa.list_(pa.float32())),
+            ('sampled_max', pa.list_(pa.float32())),
+            ('logsumexp', pa.list_(pa.float32())),
+        ])
+
+        # Convert to PyArrow with explicit schema
+        table = pa.Table.from_pandas(df, schema=schema)
 
         # Write to bytes
         buf = io.BytesIO()
@@ -669,17 +686,16 @@ def process_batch(
             row_max = vals.max(dim=-1, keepdim=True).values
             denom = (row_max - row_min).clamp(min=1e-10)
             scaled = ((vals - row_min) / denom * UINT16_MAX).round()
-            # Store as int32 for parquet compatibility
-            quantized = scaled.clamp(0, UINT16_MAX).to(torch.int64).to(torch.int32)
+            quantized = scaled.clamp(0, UINT16_MAX).to(torch.int32)
             return quantized, row_min.squeeze(-1), row_max.squeeze(-1)
-        
-        def quantize_numpy(vals: np.ndarray) -> tuple[np.ndarray, float, float]:
+
+        def quantize_numpy(vals: np.ndarray) -> tuple[np.ndarray, np.float32, np.float32]:
             """Quantize numpy array to uint16 with min/max."""
-            row_min = float(vals.min())
-            row_max = float(vals.max())
+            row_min = np.float32(vals.min())
+            row_max = np.float32(vals.max())
             denom = max(row_max - row_min, 1e-10)
             scaled = ((vals - row_min) / denom * UINT16_MAX).round()
-            quantized = scaled.clip(0, UINT16_MAX).astype(np.int32)
+            quantized = scaled.clip(0, UINT16_MAX).astype(np.uint16)
             return quantized, row_min, row_max
 
         # Quantize nucleus (variable-length) - already in numpy format
@@ -694,7 +710,7 @@ def process_batch(
         
         # Quantize sampled (fixed-length) - process as tensor
         samp_quant, samp_min, samp_max = quantize_tensor(sampled_vals)
-        samp_quant = samp_quant.cpu().numpy()
+        samp_quant = samp_quant.cpu().numpy().astype(np.uint16)
         samp_idx_np = sampled_idx.cpu().numpy().astype(np.int32)
         samp_min = samp_min.cpu().numpy().astype(np.float32)
         samp_max = samp_max.cpu().numpy().astype(np.float32)
