@@ -447,7 +447,7 @@ class TokenBudgetBatchSampler(Sampler):
 # Assistant Mask Verification
 # =============================================================================
 
-def verify_assistant_mask(tokenizer, sample_conversation: list[dict]) -> dict:
+def verify_assistant_mask(tokenizer, sample_conversation: list[dict], chat_template: Optional[str] = None) -> dict:
     """
     Verify the assistant mask correctly identifies generated tokens.
 
@@ -457,6 +457,7 @@ def verify_assistant_mask(tokenizer, sample_conversation: list[dict]) -> dict:
     Args:
         tokenizer: The tokenizer to test
         sample_conversation: A sample conversation to verify
+        chat_template: Optional custom chat template to use
 
     Returns:
         Tokenization result with verification info
@@ -466,6 +467,7 @@ def verify_assistant_mask(tokenizer, sample_conversation: list[dict]) -> dict:
         return_dict=True,
         return_tensors="pt",
         return_assistant_tokens_mask=True,
+        chat_template=chat_template,
     )
 
     input_ids = result["input_ids"].squeeze()
@@ -895,7 +897,6 @@ def run_extraction(config: ExtractionConfig, verify_mask: bool = False):
         print(f"📝 Loading custom chat template from: {config.chat_template_file}")
         with open(config.chat_template_file, 'r') as f:
             custom_chat_template = f.read()
-        tokenizer.chat_template = custom_chat_template
         print("   ✅ Custom chat template loaded")
 
     # Get special tokens to exclude
@@ -928,13 +929,13 @@ def run_extraction(config: ExtractionConfig, verify_mask: bool = False):
             {"role": "user", "content": df.iloc[0][config.user_column]},
             {"role": "assistant", "content": df.iloc[0][config.assistant_column]},
         ]
-        verify_assistant_mask(tokenizer, sample_messages)
+        verify_assistant_mask(tokenizer, sample_messages, chat_template=custom_chat_template)
         input("\nPress Enter to continue with extraction...")
 
     # Create dataset and dataloader
     dataset = ConversationDataset(df, config)
     sampler = TokenBudgetBatchSampler(lengths, config.batch_budget_thresholds)
-    collate_fn = create_collate_fn(tokenizer)
+    collate_fn = create_collate_fn(tokenizer, chat_template=custom_chat_template)
     loader = DataLoader(
         dataset,
         batch_sampler=sampler,
