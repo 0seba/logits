@@ -73,8 +73,15 @@ class ExtractionConfig:
     sampled_n: int = 24
 
     # Batch sizing based on token budget (length -> samples per batch)
+    # More conservative defaults to prevent OOM on typical GPUs
+    # Format: {max_seq_len: max_batch_size}
     batch_budget_thresholds: dict = field(default_factory=lambda: {
-        5000: 1, 2048: 2, 1024: 2, 512: 4, 256: 8, 128: 16
+        8192: 1,   # Very long sequences: single sample
+        4096: 1,   # Long sequences: single sample  
+        2048: 2,   # Medium-long: batch of 2
+        1024: 4,   # Medium: batch of 4
+        512: 8,    # Short: batch of 8
+        256: 16,   # Very short: batch of 16
     })
 
     # Upload frequency
@@ -109,6 +116,7 @@ class ExtractionConfig:
     # Processing limits
     limit_samples: Optional[int] = None
     start_offset: int = 0  # Skip first N samples
+    max_seq_len: Optional[int] = None  # Skip samples longer than this
 
     # Resume options
     resume: bool = False
@@ -163,7 +171,6 @@ class StreamingHFUploader:
         # Convert to DataFrame and then Parquet
         df = pd.DataFrame(self.buffer)
 
-        # Ensure correct dtypes for array columns
         # Convert numpy arrays to lists for parquet compatibility
         # Note: top_* columns now contain variable-length lists due to nucleus sampling
         for col in ["top_indices", "top_logits_quantized", "sampled_indices",
@@ -354,33 +361,83 @@ class ConversationDataset(Dataset):
 
 
 class TokenBudgetBatchSampler(Sampler):
-    """Batch sampler that groups by token budget to maximize GPU utilization."""
+    """Batch sampler that groups by token budget to maximize GPU utilization.
+    
+    The thresholds dict maps max sequence length -> max batch size.
+    Examples:
+        - {512: 8, 1024: 4} means:
+          - Sequences <= 512 tokens: batch size 8
+          - Sequences <= 1024 tokens: batch size 4
+          - Sequences > 1024 tokens: batch size 1 (default)
+    
+    The DataFrame should be sorted by length descending for this to work efficiently.
+    """
 
     def __init__(self, lengths: list[int], thresholds: dict, drop_last: bool = False):
         self.lengths = lengths
         self.indices = list(range(len(lengths)))
+        # Sort thresholds by length descending (longest first)
         self.thresholds = sorted(thresholds.items(), key=lambda x: -x[0])
         self.drop_last = drop_last
+        # Pre-compute number of batches for __len__
+        self._num_batches = self._compute_num_batches()
+
+    def _get_max_batch_size(self, length: int) -> int:
+        """Get max batch size for a given sequence length."""
+        for thr, cnt in self.thresholds:
+            if length <= thr:
+                return cnt
+        return 1  # Default for very long sequences
+
+    def _compute_num_batches(self) -> int:
+        """Compute total number of batches."""
+        if not self.lengths:
+            return 0
+        
+        num_batches = 0
+        batch_size = 0
+        current_max = float('inf')
+        
+        for idx in self.indices:
+            length = self.lengths[idx]
+            allowed = self._get_max_batch_size(length)
+            
+            # Start new batch if current batch is full
+            if batch_size >= current_max:
+                num_batches += 1
+                batch_size = 0
+                current_max = allowed
+            
+            batch_size += 1
+            current_max = min(current_max, allowed)
+        
+        if batch_size > 0:
+            num_batches += 1
+        
+        return num_batches
 
     def __iter__(self):
         batch = []
+        current_max = float('inf')
+        
         for idx in self.indices:
             length = self.lengths[idx]
-            # Find how many samples allowed for this length
-            allowed = 1
-            for thr, cnt in self.thresholds:
-                if length <= thr:
-                    allowed = cnt
-            if len(batch) >= allowed:
+            allowed = self._get_max_batch_size(length)
+            
+            # Start new batch if current batch is full or max batch size decreased
+            if len(batch) >= current_max:
                 yield batch
-                batch = [idx]
-            else:
-                batch.append(idx)
-        if batch and (not self.drop_last or len(batch) == allowed):
+                batch = []
+                current_max = allowed
+            
+            batch.append(idx)
+            current_max = min(current_max, allowed)
+        
+        if batch and (not self.drop_last or len(batch) == current_max):
             yield batch
 
     def __len__(self):
-        return len(self.indices)
+        return self._num_batches
 
 
 # =============================================================================
@@ -495,182 +552,184 @@ def process_batch(
     """
     device = next(model.parameters()).device
 
-    # Forward pass to get hidden states
-    outputs = model.model(
-        batch["input_ids"].to(device),
-        attention_mask=batch["attention_mask"].to(device),
-        use_cache=False,
-    )
-    hidden_states = outputs.last_hidden_state
-
-    # Build extraction mask from assistant_masks
-    assistant_mask = batch["assistant_masks"].bool()
-
-    # Exclude end-of-generation tokens if configured
-    if config.exclude_end_tokens and exclude_tokens is not None:
-        is_not_after_special = ~torch.isin(
-            batch["input_ids"].roll(1), exclude_tokens
+    # CRITICAL: Disable gradient computation to save memory
+    with torch.no_grad():
+        # Forward pass to get hidden states
+        outputs = model.model(
+            batch["input_ids"].to(device),
+            attention_mask=batch["attention_mask"].to(device),
+            use_cache=False,
         )
-        assistant_mask = assistant_mask & is_not_after_special
+        hidden_states = outputs.last_hidden_state
 
-    # Exclude thinking tag positions if configured
-    if config.exclude_think_tags and think_token_ids is not None:
-        is_not_think = torch.ones_like(batch["input_ids"], dtype=torch.bool)
-        for think_id in think_token_ids:
-            is_not_think &= ~torch.isin(batch["input_ids"], think_id)
-            for shift in range(1, 4):  # Also exclude a few tokens after
-                is_not_think &= ~torch.isin(batch["input_ids"].roll(shift), think_id)
-        assistant_mask = assistant_mask & is_not_think
+        # Build extraction mask from assistant_masks
+        assistant_mask = batch["assistant_masks"].bool()
 
-    # Get logits for assistant positions only
-    extract_positions = assistant_mask.nonzero(as_tuple=True)
-    if extract_positions[0].numel() == 0:
-        return None
+        # Exclude end-of-generation tokens if configured
+        if config.exclude_end_tokens and exclude_tokens is not None:
+            is_not_after_special = ~torch.isin(
+                batch["input_ids"].roll(1), exclude_tokens
+            )
+            assistant_mask = assistant_mask & is_not_after_special
 
-    logits = model.lm_head(hidden_states[extract_positions])  # (N, vocab)
+        # Exclude thinking tag positions if configured
+        if config.exclude_think_tags and think_token_ids is not None:
+            is_not_think = torch.ones_like(batch["input_ids"], dtype=torch.bool)
+            for think_id in think_token_ids:
+                is_not_think &= ~torch.isin(batch["input_ids"], think_id)
+                for shift in range(1, 4):  # Also exclude a few tokens after
+                    is_not_think &= ~torch.isin(batch["input_ids"].roll(shift), think_id)
+            assistant_mask = assistant_mask & is_not_think
 
-    # Compute logsumexp for normalization info
-    lse = torch.logsumexp(logits.float(), dim=-1, keepdim=True)
-    probs = torch.exp(logits.float() - lse)
+        # Get logits for assistant positions only
+        extract_positions = assistant_mask.nonzero(as_tuple=True)
+        if extract_positions[0].numel() == 0:
+            return None
 
-    # Count tokens per sample in batch
-    sizes = assistant_mask.sum(dim=-1).tolist()
+        logits = model.lm_head(hidden_states[extract_positions])  # (N, vocab)
 
-    # Nucleus (top-p) sampling: extract top logits that accumulate to p probability
-    N, vocab_size = probs.size()
-    
-    # Sort probabilities in descending order
-    sorted_probs, sorted_idx = torch.sort(probs, dim=-1, descending=True)
-    
-    # Compute cumulative sum of sorted probabilities
-    cumsum_probs = torch.cumsum(sorted_probs, dim=-1)
-    
-    # Find the nucleus: tokens whose cumulative probability <= top_p
-    # We use <= to include the token that pushes us over the threshold
-    nucleus_mask = cumsum_probs <= config.top_p
-    
-    # Always include at least the top token (in case top_p is very small)
-    nucleus_mask[:, 0] = True
-    
-    # Apply hard maximum constraint
-    position_mask = torch.arange(vocab_size, device=probs.device).expand(N, -1) < config.top_p_max_elements
-    nucleus_mask = nucleus_mask & position_mask
-    
-    # Extract nucleus indices and values (variable length per row)
-    nucleus_idx_list = []
-    nucleus_vals_list = []
-    nucleus_mask_bool = []
-    
-    for i in range(N):
-        row_nucleus_mask = nucleus_mask[i]
-        row_indices = sorted_idx[i][row_nucleus_mask]
-        row_values = logits.float()[i][row_indices]
+        # Compute logsumexp for normalization info
+        lse = torch.logsumexp(logits.float(), dim=-1, keepdim=True)
+        probs = torch.exp(logits.float() - lse)
+
+        # Count tokens per sample in batch
+        sizes = assistant_mask.sum(dim=-1).tolist()
+
+        # Nucleus (top-p) sampling: extract top logits that accumulate to p probability
+        N, vocab_size = probs.size()
         
-        nucleus_idx_list.append(row_indices.cpu().numpy().astype(np.int32))
-        nucleus_vals_list.append(row_values.cpu().numpy().astype(np.float32))
-        nucleus_mask_bool.append(row_nucleus_mask)
-    
-    # Create a mask for remaining vocabulary sampling
-    # Convert list of masks back to tensor
-    nucleus_mask_tensor = torch.stack(nucleus_mask_bool)
-    
-    # Sample additional tokens from remaining vocabulary (outside nucleus)
-    probs_rest = probs.clone()
-    probs_rest[nucleus_mask_tensor] = 0.0
-    rest_sum = probs_rest.sum(dim=-1, keepdim=True)
-
-    # Handle edge case where all probability is in nucleus
-    zero_rest = (rest_sum.squeeze(-1) < 1e-10)
-    if zero_rest.any():
-        # For these rows, sample uniformly from tokens not in nucleus
-        uniform_mask = ~nucleus_mask_tensor[zero_rest]
-        counts = uniform_mask.sum(dim=-1, keepdim=True).float().clamp(min=1.0)
-        probs_rest[zero_rest] = uniform_mask.float() / counts
-
-    # Renormalize remaining probabilities
-    rest_sum = probs_rest.sum(dim=-1, keepdim=True).clamp(min=1e-30)
-    probs_rest = probs_rest / rest_sum
-
-    # Sample from remaining distribution
-    sampled_idx = torch.multinomial(probs_rest, config.sampled_n)
-    sampled_vals = logits.float().gather(-1, sampled_idx)
-
-    # Quantize per-token with row-wise min/max
-    def quantize_tensor(vals: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Quantize values to uint16 with per-row min/max."""
-        row_min = vals.min(dim=-1, keepdim=True).values
-        row_max = vals.max(dim=-1, keepdim=True).values
-        denom = (row_max - row_min).clamp(min=1e-10)
-        scaled = ((vals - row_min) / denom * UINT16_MAX).round()
-        # Store as int32 for parquet compatibility
-        quantized = scaled.clamp(0, UINT16_MAX).to(torch.int64).to(torch.int32)
-        return quantized, row_min.squeeze(-1), row_max.squeeze(-1)
-    
-    def quantize_numpy(vals: np.ndarray) -> tuple[np.ndarray, float, float]:
-        """Quantize numpy array to uint16 with min/max."""
-        row_min = float(vals.min())
-        row_max = float(vals.max())
-        denom = max(row_max - row_min, 1e-10)
-        scaled = ((vals - row_min) / denom * UINT16_MAX).round()
-        quantized = scaled.clip(0, UINT16_MAX).astype(np.int32)
-        return quantized, row_min, row_max
-
-    # Quantize nucleus (variable-length) - already in numpy format
-    nucleus_quant_list = []
-    nucleus_min_list = []
-    nucleus_max_list = []
-    for vals in nucleus_vals_list:
-        quant, vmin, vmax = quantize_numpy(vals)
-        nucleus_quant_list.append(quant)
-        nucleus_min_list.append(vmin)
-        nucleus_max_list.append(vmax)
-    
-    # Quantize sampled (fixed-length) - process as tensor
-    samp_quant, samp_min, samp_max = quantize_tensor(sampled_vals)
-    samp_quant = samp_quant.cpu().numpy()
-    samp_idx_np = sampled_idx.cpu().numpy().astype(np.int32)
-    samp_min = samp_min.cpu().numpy().astype(np.float32)
-    samp_max = samp_max.cpu().numpy().astype(np.float32)
-
-    lse_np = lse.squeeze(-1).cpu().numpy().astype(np.float32)
-
-    # Split by sample and create output dicts
-    results = []
-    offset = 0
-    for i, size in enumerate(sizes):
-        if size == 0:
-            continue
-
-        end = offset + size
+        # Sort probabilities in descending order
+        sorted_probs, sorted_idx = torch.sort(probs, dim=-1, descending=True)
         
-        # Extract variable-length nucleus data for this sample
-        sample_nucleus_idx = nucleus_idx_list[offset:end]
-        sample_nucleus_quant = nucleus_quant_list[offset:end]
-        sample_nucleus_min = nucleus_min_list[offset:end]
-        sample_nucleus_max = nucleus_max_list[offset:end]
+        # Compute cumulative sum of sorted probabilities
+        cumsum_probs = torch.cumsum(sorted_probs, dim=-1)
         
-        # Extract fixed-length sampled data for this sample
-        sample_samp_idx = samp_idx_np[offset:end]
-        sample_samp_quant = samp_quant[offset:end]
-        sample_samp_min = samp_min[offset:end]
-        sample_samp_max = samp_max[offset:end]
+        # Find the nucleus: tokens whose cumulative probability <= top_p
+        # We use <= to include the token that pushes us over the threshold
+        nucleus_mask = cumsum_probs <= config.top_p
         
-        results.append({
-            "index": int(indexes[i]),
-            "num_tokens": size,
-            # Nucleus (top-p) logits - variable length per token
-            "top_indices": [idx.tolist() for idx in sample_nucleus_idx],
-            "top_logits_quantized": [q.tolist() for q in sample_nucleus_quant],
-            "top_min": sample_nucleus_min,
-            "top_max": sample_nucleus_max,
-            # Sampled logits - fixed length
-            "sampled_indices": sample_samp_idx.tolist(),
-            "sampled_logits_quantized": sample_samp_quant.tolist(),
-            "sampled_min": sample_samp_min.tolist(),
-            "sampled_max": sample_samp_max.tolist(),
-            "logsumexp": lse_np[offset:end].tolist(),
-        })
-        offset = end
+        # Always include at least the top token (in case top_p is very small)
+        nucleus_mask[:, 0] = True
+        
+        # Apply hard maximum constraint
+        position_mask = torch.arange(vocab_size, device=probs.device).expand(N, -1) < config.top_p_max_elements
+        nucleus_mask = nucleus_mask & position_mask
+        
+        # Extract nucleus indices and values (variable length per row)
+        nucleus_idx_list = []
+        nucleus_vals_list = []
+        nucleus_mask_bool = []
+        
+        for i in range(N):
+            row_nucleus_mask = nucleus_mask[i]
+            row_indices = sorted_idx[i][row_nucleus_mask]
+            row_values = logits.float()[i][row_indices]
+            
+            nucleus_idx_list.append(row_indices.cpu().numpy().astype(np.int32))
+            nucleus_vals_list.append(row_values.cpu().numpy().astype(np.float32))
+            nucleus_mask_bool.append(row_nucleus_mask)
+        
+        # Create a mask for remaining vocabulary sampling
+        # Convert list of masks back to tensor
+        nucleus_mask_tensor = torch.stack(nucleus_mask_bool)
+        
+        # Sample additional tokens from remaining vocabulary (outside nucleus)
+        probs_rest = probs.clone()
+        probs_rest[nucleus_mask_tensor] = 0.0
+        rest_sum = probs_rest.sum(dim=-1, keepdim=True)
+
+        # Handle edge case where all probability is in nucleus
+        zero_rest = (rest_sum.squeeze(-1) < 1e-10)
+        if zero_rest.any():
+            # For these rows, sample uniformly from tokens not in nucleus
+            uniform_mask = ~nucleus_mask_tensor[zero_rest]
+            counts = uniform_mask.sum(dim=-1, keepdim=True).float().clamp(min=1.0)
+            probs_rest[zero_rest] = uniform_mask.float() / counts
+
+        # Renormalize remaining probabilities
+        rest_sum = probs_rest.sum(dim=-1, keepdim=True).clamp(min=1e-30)
+        probs_rest = probs_rest / rest_sum
+
+        # Sample from remaining distribution
+        sampled_idx = torch.multinomial(probs_rest, config.sampled_n)
+        sampled_vals = logits.float().gather(-1, sampled_idx)
+
+        # Quantize per-token with row-wise min/max
+        def quantize_tensor(vals: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            """Quantize values to uint16 with per-row min/max."""
+            row_min = vals.min(dim=-1, keepdim=True).values
+            row_max = vals.max(dim=-1, keepdim=True).values
+            denom = (row_max - row_min).clamp(min=1e-10)
+            scaled = ((vals - row_min) / denom * UINT16_MAX).round()
+            # Store as int32 for parquet compatibility
+            quantized = scaled.clamp(0, UINT16_MAX).to(torch.int64).to(torch.int32)
+            return quantized, row_min.squeeze(-1), row_max.squeeze(-1)
+        
+        def quantize_numpy(vals: np.ndarray) -> tuple[np.ndarray, float, float]:
+            """Quantize numpy array to uint16 with min/max."""
+            row_min = float(vals.min())
+            row_max = float(vals.max())
+            denom = max(row_max - row_min, 1e-10)
+            scaled = ((vals - row_min) / denom * UINT16_MAX).round()
+            quantized = scaled.clip(0, UINT16_MAX).astype(np.int32)
+            return quantized, row_min, row_max
+
+        # Quantize nucleus (variable-length) - already in numpy format
+        nucleus_quant_list = []
+        nucleus_min_list = []
+        nucleus_max_list = []
+        for vals in nucleus_vals_list:
+            quant, vmin, vmax = quantize_numpy(vals)
+            nucleus_quant_list.append(quant)
+            nucleus_min_list.append(vmin)
+            nucleus_max_list.append(vmax)
+        
+        # Quantize sampled (fixed-length) - process as tensor
+        samp_quant, samp_min, samp_max = quantize_tensor(sampled_vals)
+        samp_quant = samp_quant.cpu().numpy()
+        samp_idx_np = sampled_idx.cpu().numpy().astype(np.int32)
+        samp_min = samp_min.cpu().numpy().astype(np.float32)
+        samp_max = samp_max.cpu().numpy().astype(np.float32)
+
+        lse_np = lse.squeeze(-1).cpu().numpy().astype(np.float32)
+
+        # Split by sample and create output dicts
+        results = []
+        offset = 0
+        for i, size in enumerate(sizes):
+            if size == 0:
+                continue
+
+            end = offset + size
+            
+            # Extract variable-length nucleus data for this sample
+            sample_nucleus_idx = nucleus_idx_list[offset:end]
+            sample_nucleus_quant = nucleus_quant_list[offset:end]
+            sample_nucleus_min = nucleus_min_list[offset:end]
+            sample_nucleus_max = nucleus_max_list[offset:end]
+            
+            # Extract fixed-length sampled data for this sample
+            sample_samp_idx = samp_idx_np[offset:end]
+            sample_samp_quant = samp_quant[offset:end]
+            sample_samp_min = samp_min[offset:end]
+            sample_samp_max = samp_max[offset:end]
+            
+            results.append({
+                "index": int(indexes[i]),
+                "num_tokens": size,
+                # Nucleus (top-p) logits - variable length per token
+                "top_indices": [idx.tolist() for idx in sample_nucleus_idx],
+                "top_logits_quantized": [q.tolist() for q in sample_nucleus_quant],
+                "top_min": sample_nucleus_min,
+                "top_max": sample_nucleus_max,
+                # Sampled logits - fixed length
+                "sampled_indices": sample_samp_idx.tolist(),
+                "sampled_logits_quantized": sample_samp_quant.tolist(),
+                "sampled_min": sample_samp_min.tolist(),
+                "sampled_max": sample_samp_max.tolist(),
+                "logsumexp": lse_np[offset:end].tolist(),
+            })
+            offset = end
 
     return results
 
@@ -746,6 +805,14 @@ def prepare_dataset(config: ExtractionConfig,
         df = df.head(config.limit_samples)
         print(f"🔢 Limiting to {len(df)} samples")
 
+    # Filter out samples that are too long
+    if config.max_seq_len and "length" in df.columns:
+        original_len = len(df)
+        df = df[df["length"] <= config.max_seq_len]
+        skipped = original_len - len(df)
+        if skipped > 0:
+            print(f"⏭️  Skipped {skipped} samples longer than {config.max_seq_len} tokens")
+
     # Sort by length descending for better batching
     if "length" in df.columns and df["length"].sum() > 0:
         df = df.sort_values("length", ascending=False)
@@ -809,6 +876,11 @@ def run_extraction(config: ExtractionConfig, verify_mask: bool = False):
         attn_implementation=config.attn_implementation,
         torch_dtype=dtype_map.get(config.torch_dtype, torch.bfloat16),
     )
+    # CRITICAL: Set model to eval mode and disable gradient computation
+    model.eval()
+    for param in model.parameters():
+        param.requires_grad = False
+    
     tokenizer = AutoTokenizer.from_pretrained(config.model_id)
 
     if tokenizer.pad_token_id is None:
@@ -855,7 +927,7 @@ def run_extraction(config: ExtractionConfig, verify_mask: bool = False):
         dataset,
         batch_sampler=sampler,
         collate_fn=collate_fn,
-        num_workers=1,
+        num_workers=0,  # Use 0 to avoid issues with multiprocessing
     )
 
     # Process loop
@@ -920,9 +992,13 @@ def parse_args():
     parser.add_argument("--sampled-n", type=int, default=24,
                         help="Number of additional logits to sample from remaining vocab")
 
-    # Batch sizing
+    # Batch sizing - simple options
     parser.add_argument("--batch-thresholds", type=str, default=None,
-                        help="JSON dict of length->samples_per_batch")
+                        help="JSON dict of length->samples_per_batch (e.g., '{\"1024\":4,\"512\":8}')")
+    parser.add_argument("--max-batch-size", type=int, default=None,
+                        help="Simple max batch size override (applies to all lengths)")
+    parser.add_argument("--max-seq-len", type=int, default=None,
+                        help="Skip samples longer than this (prevent OOM)")
 
     # Upload options
     parser.add_argument("--upload-every", type=int, default=500,
@@ -992,6 +1068,16 @@ def main():
     batch_thresholds = None
     if args.batch_thresholds:
         batch_thresholds = json.loads(args.batch_thresholds)
+    elif args.max_batch_size:
+        # Simple override: use the same max batch size for all lengths
+        batch_thresholds = {
+            8192: 1,
+            4096: min(2, args.max_batch_size),
+            2048: min(4, args.max_batch_size),
+            1024: min(8, args.max_batch_size),
+            512: args.max_batch_size,
+            256: args.max_batch_size,
+        }
 
     # Parse subject sampling
     sample_per_subject = None
@@ -1007,7 +1093,7 @@ def main():
         top_p_max_elements=args.top_p_max,
         sampled_n=args.sampled_n,
         batch_budget_thresholds=batch_thresholds or {
-            5000: 1, 2048: 2, 1024: 2, 512: 4, 256: 8, 128: 16
+            8192: 1, 4096: 1, 2048: 2, 1024: 4, 512: 8, 256: 16
         },
         upload_every_n_samples=args.upload_every,
         device=args.device,
@@ -1023,6 +1109,7 @@ def main():
         sample_per_subject=sample_per_subject,
         limit_samples=args.limit if not args.full_dataset else None,
         start_offset=args.start_offset,
+        max_seq_len=args.max_seq_len,
         exclude_think_tags=not args.include_think,
         exclude_end_tokens=not args.include_end,
         resume=args.resume,
