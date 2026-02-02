@@ -230,19 +230,17 @@ class StreamingHFUploader:
             [
                 ("index", pa.int32()),
                 ("num_tokens", pa.int32()),
-                # Nucleus (top-p) - variable length
-                ("top_indices_low", pa.list_(pa.list_(pa.uint16()))),
-                ("top_indices_high", pa.list_(pa.binary())),  # Packed 2-bit high parts
-                ("top_logits_quantized", pa.list_(pa.list_(pa.uint16()))),
+                # Nucleus (flattened)
+                ("top_indices_low", pa.list_(pa.uint16())),
+                ("top_indices_high", pa.binary()),  # Flattened binary
+                ("top_logits_quantized", pa.list_(pa.uint16())),
+                ("top_counts", pa.list_(pa.uint8())),  # New counts column
                 ("top_min", pa.list_(pa.float32())),
                 ("top_max", pa.list_(pa.float32())),
-                # Sampled - fixed length
-                ("sampled_indices_low", pa.list_(pa.list_(pa.uint16()))),
-                (
-                    "sampled_indices_high",
-                    pa.list_(pa.binary()),
-                ),  # Packed 2-bit high parts
-                ("sampled_logits_quantized", pa.list_(pa.list_(pa.uint16()))),
+                # Sampled (flattened)
+                ("sampled_indices_low", pa.list_(pa.uint16())),
+                ("sampled_indices_high", pa.binary()),
+                ("sampled_logits_quantized", pa.list_(pa.uint16())),
                 ("sampled_min", pa.list_(pa.float32())),
                 ("sampled_max", pa.list_(pa.float32())),
                 ("logsumexp", pa.list_(pa.float32())),
@@ -817,19 +815,28 @@ def process_batch(
             end = offset + size
 
             # Extract variable-length nucleus data for this sample
-            # Note: keeping as numpy arrays / lists of numpy arrays
             sample_nucleus_idx = nucleus_idx_list[offset:end]
             sample_nucleus_quant = nucleus_quant_list[offset:end]
             sample_nucleus_min = nucleus_min_list[offset:end]
             sample_nucleus_max = nucleus_max_list[offset:end]
 
-            # Pack nucleus indices
-            sample_nucleus_idx_low = []
-            sample_nucleus_idx_high = []
-            for idx_arr in sample_nucleus_idx:
-                low, high = pack_indices(idx_arr)
-                sample_nucleus_idx_low.append(low)
-                sample_nucleus_idx_high.append(high)
+            # Flatten nucleus data
+            if len(sample_nucleus_idx) > 0:
+                flat_nucleus_idx = np.concatenate(sample_nucleus_idx)
+                flat_nucleus_quant = np.concatenate(sample_nucleus_quant)
+                # Ensure counts are within uint8 (max 255 elements)
+                top_counts = np.array(
+                    [len(x) for x in sample_nucleus_idx], dtype=np.uint8
+                )
+
+                # Pack flattened indices
+                nucleus_low, nucleus_high_bytes = pack_indices(flat_nucleus_idx)
+            else:
+                flat_nucleus_idx = np.array([], dtype=np.int32)
+                nucleus_low = np.array([], dtype=np.uint16)
+                nucleus_high_bytes = b""
+                top_counts = np.array([], dtype=np.uint8)
+                flat_nucleus_quant = np.array([], dtype=np.uint16)
 
             # Extract fixed-length sampled data for this sample
             sample_samp_idx = samp_idx_np[offset:end]
@@ -837,37 +844,40 @@ def process_batch(
             sample_samp_min = samp_min[offset:end]
             sample_samp_max = samp_max[offset:end]
 
-            # Pack sampled indices
-            sample_samp_idx_low = []
-            sample_samp_idx_high = []
-            for j in range(len(sample_samp_idx)):
-                low, high = pack_indices(sample_samp_idx[j])
-                sample_samp_idx_low.append(low)
-                sample_samp_idx_high.append(high)
+            # Flatten sampled data
+            if len(sample_samp_idx) > 0:
+                flat_samp_idx = sample_samp_idx.flatten()
+                flat_samp_quant = sample_samp_quant.flatten()
+
+                # Pack flattened indices
+                samp_low, samp_high_bytes = pack_indices(flat_samp_idx)
+            else:
+                samp_low = np.array([], dtype=np.uint16)
+                samp_high_bytes = b""
+                flat_samp_quant = np.array([], dtype=np.uint16)
 
             results.append(
                 {
                     "index": np.int32(indexes[i]),
                     "num_tokens": np.int32(size),
-                    # Nucleus (top-p) logits
-                    "top_indices_low": sample_nucleus_idx_low,
-                    "top_indices_high": sample_nucleus_idx_high,
-                    "top_logits_quantized": sample_nucleus_quant,
+                    # Nucleus (flattened)
+                    "top_indices_low": nucleus_low,
+                    "top_indices_high": nucleus_high_bytes,
+                    "top_logits_quantized": flat_nucleus_quant,
+                    "top_counts": top_counts,
                     "top_min": sample_nucleus_min,
                     "top_max": sample_nucleus_max,
-                    # Sampled logits
-                    "sampled_indices_low": sample_samp_idx_low,
-                    "sampled_indices_high": sample_samp_idx_high,
-                    "sampled_logits_quantized": [
-                        sample_samp_quant[j] for j in range(size)
-                    ],  # Convert 2D array to list of 1D arrays
-                    "sampled_min": [sample_samp_min[j] for j in range(size)],
-                    "sampled_max": [sample_samp_max[j] for j in range(size)],
+                    # Sampled (flattened)
+                    "sampled_indices_low": samp_low,
+                    "sampled_indices_high": samp_high_bytes,
+                    "sampled_logits_quantized": flat_samp_quant,
+                    # No counts needed for sampled (fixed stride = sampled_n)
+                    "sampled_min": sample_samp_min.tolist(),  # List of scalars
+                    "sampled_max": sample_samp_max.tolist(),  # List of scalars
                     "logsumexp": [lse_np[j] for j in range(offset, end)],
                 }
             )
             offset = end
-
     return results
 
 

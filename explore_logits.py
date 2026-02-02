@@ -48,9 +48,52 @@ def unpack_indices(low_bits_list, high_bits_list, sizes_list=None):
         high_bits_list: List of bytes/binary high bits (packed)
         sizes_list: Optional list of expected sizes (if not provided, inferred from low_bits)
 
+
     Returns:
         List of numpy arrays (int32) containing the full indices
     """
+    # Check if inputs are flattened (single array/bytes) vs list of arrays
+    is_flattened = isinstance(low_bits_list, (np.ndarray, list)) and (
+        len(low_bits_list) > 0 and not isinstance(low_bits_list[0], (np.ndarray, list))
+    )
+
+    # If flattened, we need sizes to slice
+    if is_flattened:
+        if sizes_list is None:
+            raise ValueError("sizes_list required for unpacking flattened indices")
+
+        # Unpack high bits from single binary blob
+        if isinstance(high_bits_list, (bytes, bytearray)):
+            packed_arr = np.frombuffer(high_bits_list, dtype=np.uint8)
+        else:
+            packed_arr = np.array(high_bits_list, dtype=np.uint8)
+
+        # Unpack all high bits at once
+        hi0 = packed_arr & 0x03
+        hi1 = (packed_arr >> 2) & 0x03
+        hi2 = (packed_arr >> 4) & 0x03
+        hi3 = (packed_arr >> 6) & 0x03
+
+        all_high_parts = np.stack([hi0, hi1, hi2, hi3], axis=1).flatten()
+        all_low_bits = np.asarray(low_bits_list, dtype=np.int32)
+
+        # Trim high parts to match low bits length
+        all_high_parts = all_high_parts[: len(all_low_bits)]
+
+        # Combine
+        all_full_indices = all_low_bits | (all_high_parts.astype(np.int32) << 16)
+
+        # Slice into per-token arrays
+        unpacked_indices = []
+        offset = 0
+        for size in sizes_list:
+            end = offset + size
+            unpacked_indices.append(all_full_indices[offset:end])
+            offset = end
+
+        return unpacked_indices
+
+    # Legacy (List of Lists) handling
     unpacked_indices = []
 
     for i, (low, high_bytes) in enumerate(zip(low_bits_list, high_bits_list)):
@@ -139,16 +182,59 @@ def get_sample(dataset, index: int = 0) -> Dict[str, Any]:
         if item is None:
             raise IndexError(f"Index {index} out of range")
 
-    # Hydrate packed indices if present (backward compatibility)
+    # Hydrate packed/flattened indices if present
     if "top_indices_low" in item and "top_indices" not in item:
-        item["top_indices"] = unpack_indices(
-            item["top_indices_low"], item["top_indices_high"]
-        )
+        if "top_counts" in item:
+            # Flattened format with counts
+            counts = item["top_counts"]
+            item["top_indices"] = unpack_indices(
+                item["top_indices_low"], item["top_indices_high"], sizes_list=counts
+            )
+
+            # Also slice logits if they are flattened
+            if not isinstance(item["top_logits_quantized"][0], (list, np.ndarray)):
+                flat_logits = np.array(item["top_logits_quantized"], dtype=np.uint16)
+                item["top_logits_quantized"] = []
+                offset = 0
+                for size in counts:
+                    end = offset + size
+                    item["top_logits_quantized"].append(flat_logits[offset:end])
+                    offset = end
+        else:
+            # Legacy list-of-lists packed format
+            item["top_indices"] = unpack_indices(
+                item["top_indices_low"], item["top_indices_high"]
+            )
 
     if "sampled_indices_low" in item and "sampled_indices" not in item:
-        item["sampled_indices"] = unpack_indices(
-            item["sampled_indices_low"], item["sampled_indices_high"]
-        )
+        # Determine stride/counts
+        total_len = len(item["sampled_indices_low"])
+        num_tokens = item["num_tokens"]
+
+        if num_tokens > 0:
+            stride = total_len // num_tokens
+            counts = [stride] * num_tokens
+
+            item["sampled_indices"] = unpack_indices(
+                item["sampled_indices_low"],
+                item["sampled_indices_high"],
+                sizes_list=counts,
+            )
+
+            # Slice logits if flattened
+            if not isinstance(item["sampled_logits_quantized"][0], (list, np.ndarray)):
+                flat_logits = np.array(
+                    item["sampled_logits_quantized"], dtype=np.uint16
+                )
+                item["sampled_logits_quantized"] = []
+                offset = 0
+                for size in counts:
+                    end = offset + size
+                    item["sampled_logits_quantized"].append(flat_logits[offset:end])
+                    offset = end
+        else:
+            item["sampled_indices"] = []
+            item["sampled_logits_quantized"] = []
 
     return item
 
