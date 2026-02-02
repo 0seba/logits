@@ -207,7 +207,7 @@ class StreamingHFUploader:
     def add_sample(self, sample: dict):
         """Add a processed sample to the buffer."""
         self.buffer.append(sample)
-        self.processed_indices.add(sample["index"])
+        self.processed_indices.add(int(sample["index"]))
 
     def should_flush(self) -> bool:
         """Check if buffer should be flushed."""
