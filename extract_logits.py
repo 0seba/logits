@@ -51,38 +51,84 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
 # =============================================================================
+# Helper: Index Packing
+# =============================================================================
+
+
+def pack_indices(indices: np.ndarray) -> tuple[np.ndarray, bytes]:
+    """
+    Pack an array of indices (int32) into:
+    - low_bits: uint16 array (indices & 0xFFFF)
+    - high_bits: bytes (packed 2-bit chunks for high bits)
+
+    Returns:
+        (low_bits_array, high_bits_bytes)
+    """
+    if len(indices) == 0:
+        return np.array([], dtype=np.uint16), b""
+
+    # 1. Low 16 bits -> uint16
+    low_bits = (indices & 0xFFFF).astype(np.uint16)
+
+    # 2. High 2 bits -> packed uint8
+    high_parts = (indices >> 16) & 0x03
+
+    # Pad to multiple of 4 for packing
+    rem = len(high_parts) % 4
+    if rem != 0:
+        pad_len = 4 - rem
+        high_parts = np.pad(high_parts, (0, pad_len), constant_values=0)
+
+    # Reshape to (N/4, 4) and pack
+    # Pack 4 items into one byte: (d << 6) | (c << 4) | (b << 2) | a
+    high_parts_reshaped = high_parts.reshape(-1, 4)
+    packed_high = (
+        (high_parts_reshaped[:, 0])
+        | (high_parts_reshaped[:, 1] << 2)
+        | (high_parts_reshaped[:, 2] << 4)
+        | (high_parts_reshaped[:, 3] << 6)
+    ).astype(np.uint8)
+
+    return low_bits, packed_high.tobytes()
+
+
+# =============================================================================
 # Configuration
 # =============================================================================
+
 
 @dataclass
 class ExtractionConfig:
     """Configuration for logit extraction."""
+
     model_id: str
     dataset_id: str
     hf_output_repo: str
 
     # Processing options
     dataset_split: str = "train"
-    
+
     # Nucleus (top-p) sampling: extract top logits that accumulate to p probability
     # with a hard maximum of 100 elements
     top_p: float = 0.98
     top_p_max_elements: int = 100
-    
+
     # Additional sampled logits from remaining vocabulary
     sampled_n: int = 24
 
     # Batch sizing based on token budget (length -> samples per batch)
     # More conservative defaults to prevent OOM on typical GPUs
     # Format: {max_seq_len: max_batch_size}
-    batch_budget_thresholds: dict = field(default_factory=lambda: {
-        8192: 1,   # Very long sequences: single sample
-        4096: 1,   # Long sequences: single sample  
-        2048: 2,   # Medium-long: batch of 2
-        1024: 4,   # Medium: batch of 4
-        512: 8,    # Short: batch of 8
-        256: 16,   # Very short: batch of 16
-    })
+    batch_budget_thresholds: dict = field(
+        default_factory=lambda: {
+            8192: 1,  # Very long sequences: single sample
+            4096: 1,  # Long sequences: single sample
+            2048: 2,  # Medium-long: batch of 2
+            1024: 4,  # Medium: batch of 4
+            512: 8,  # Short: batch of 8
+            256: 16,  # Very short: batch of 16
+        }
+    )
 
     # Upload frequency
     upload_every_n_samples: int = 500
@@ -133,6 +179,7 @@ class ExtractionConfig:
 # Streaming HuggingFace Upload
 # =============================================================================
 
+
 class StreamingHFUploader:
     """Handles incremental upload of processed samples to HuggingFace Hub."""
 
@@ -171,35 +218,52 @@ class StreamingHFUploader:
         if not self.buffer:
             return
 
-        # Convert to DataFrame and then Parquet
+        # Convert to DataFrame
         df = pd.DataFrame(self.buffer)
 
-        # Convert numpy arrays to lists for parquet compatibility
-        # Note: top_* columns now contain variable-length lists due to nucleus sampling
-        for col in ["top_indices", "top_logits_quantized", "sampled_indices",
-                    "sampled_logits_quantized"]:
-            if col in df.columns:
-                df[col] = df[col].apply(lambda x: list(x) if isinstance(x, np.ndarray) else x)
+        # No longer converting numpy arrays to lists - PyArrow handles list of numpy arrays fine
+        # and it's much more memory efficient.
 
-        # Define explicit schema with efficient types
-        schema = pa.schema([
-            ('index', pa.int32()),
-            ('num_tokens', pa.int32()),
-            # Variable-length lists per token
-            ('top_indices', pa.list_(pa.list_(pa.int32()))),
-            ('top_logits_quantized', pa.list_(pa.list_(pa.uint16()))),
-            ('top_min', pa.list_(pa.float32())),
-            ('top_max', pa.list_(pa.float32())),
-            # Fixed-length lists per token
-            ('sampled_indices', pa.list_(pa.list_(pa.int32()))),
-            ('sampled_logits_quantized', pa.list_(pa.list_(pa.uint16()))),
-            ('sampled_min', pa.list_(pa.float32())),
-            ('sampled_max', pa.list_(pa.float32())),
-            ('logsumexp', pa.list_(pa.float32())),
-        ])
+        # Define explicit schema with efficient types and packed indices
+        # Note: 'top_indices' and 'sampled_indices' are now split into low (uint16) and high (packed bytes)
+        schema = pa.schema(
+            [
+                ("index", pa.int32()),
+                ("num_tokens", pa.int32()),
+                # Nucleus (top-p) - variable length
+                ("top_indices_low", pa.list_(pa.list_(pa.uint16()))),
+                ("top_indices_high", pa.list_(pa.binary())),  # Packed 2-bit high parts
+                ("top_logits_quantized", pa.list_(pa.list_(pa.uint16()))),
+                ("top_min", pa.list_(pa.float32())),
+                ("top_max", pa.list_(pa.float32())),
+                # Sampled - fixed length
+                ("sampled_indices_low", pa.list_(pa.list_(pa.uint16()))),
+                (
+                    "sampled_indices_high",
+                    pa.list_(pa.binary()),
+                ),  # Packed 2-bit high parts
+                ("sampled_logits_quantized", pa.list_(pa.list_(pa.uint16()))),
+                ("sampled_min", pa.list_(pa.float32())),
+                ("sampled_max", pa.list_(pa.float32())),
+                ("logsumexp", pa.list_(pa.float32())),
+            ]
+        )
+
+        if self.part_number == 0:
+            print("\n📊 PyArrow Schema:")
+            print(schema)
 
         # Convert to PyArrow with explicit schema
-        table = pa.Table.from_pandas(df, schema=schema)
+        try:
+            table = pa.Table.from_pandas(df, schema=schema)
+        except Exception as e:
+            print(f"\n❌ Error converting to PyArrow table: {e}")
+            # Debug: print first row types
+            if len(self.buffer) > 0:
+                print("First row types:")
+                for k, v in self.buffer[0].items():
+                    print(f"  {k}: {type(v)}")
+            raise e
 
         # Write to bytes
         buf = io.BytesIO()
@@ -216,16 +280,17 @@ class StreamingHFUploader:
                 repo_type="dataset",
             )
             self.total_samples_uploaded += len(self.buffer)
-            print(f"\n📤 Uploaded {filename} ({len(self.buffer)} samples, "
-                  f"total: {self.total_samples_uploaded})")
+            print(
+                f"\n📤 Uploaded {filename} ({len(self.buffer)} samples, "
+                f"total: {self.total_samples_uploaded})"
+            )
         except Exception as e:
             print(f"\n⚠️ Upload failed for {filename}: {e}")
             # Save locally as backup
             backup_path = os.path.join(
-                self.config.cache_dir,
-                f"backup_{filename.replace('/', '_')}"
+                self.config.cache_dir, f"backup_{filename.replace('/', '_')}"
             )
-            with open(backup_path, 'wb') as f:
+            with open(backup_path, "wb") as f:
                 buf.seek(0)
                 f.write(buf.read())
             print(f"   Saved backup to {backup_path}")
@@ -248,12 +313,12 @@ class StreamingHFUploader:
                 "top_p": self.config.top_p,
                 "top_p_max_elements": self.config.top_p_max_elements,
                 "sampled_n": self.config.sampled_n,
-            }
+            },
         }
 
         # Save local checkpoint
         local_path = self._local_checkpoint_path()
-        with open(local_path, 'w') as f:
+        with open(local_path, "w") as f:
             json.dump(checkpoint, f, indent=2)
 
         # Save remote checkpoint
@@ -287,7 +352,9 @@ class StreamingHFUploader:
                     checkpoint = json.load(f)
                     part_number = checkpoint.get("part_number", 0)
                     processed_indices = set(checkpoint.get("processed_indices", []))
-                    print(f"📍 Loaded local checkpoint: {len(processed_indices)} samples")
+                    print(
+                        f"📍 Loaded local checkpoint: {len(processed_indices)} samples"
+                    )
             except Exception as e:
                 print(f"Note: Could not load local checkpoint: {e}")
 
@@ -319,6 +386,7 @@ class StreamingHFUploader:
 # Graceful Interruption Handler
 # =============================================================================
 
+
 class GracefulInterrupt:
     """Handle Ctrl+C gracefully by flushing data before exit."""
 
@@ -340,7 +408,9 @@ class GracefulInterrupt:
         """Check if we should stop processing and exit gracefully."""
         if self.interrupted:
             self.uploader.flush(final=True)
-            print(f"\n✅ Saved progress. {self.uploader.total_samples_uploaded} samples uploaded.")
+            print(
+                f"\n✅ Saved progress. {self.uploader.total_samples_uploaded} samples uploaded."
+            )
             print(f"   Run with --resume to continue from where you left off.")
             sys.exit(0)
 
@@ -348,6 +418,7 @@ class GracefulInterrupt:
 # =============================================================================
 # Dataset and DataLoader
 # =============================================================================
+
 
 class ConversationDataset(Dataset):
     """Dataset that wraps conversations for logit extraction."""
@@ -382,14 +453,14 @@ class ConversationDataset(Dataset):
 
 class TokenBudgetBatchSampler(Sampler):
     """Batch sampler that groups by token budget to maximize GPU utilization.
-    
+
     The thresholds dict maps max sequence length -> max batch size.
     Examples:
         - {512: 8, 1024: 4} means:
           - Sequences <= 512 tokens: batch size 8
           - Sequences <= 1024 tokens: batch size 4
           - Sequences > 1024 tokens: batch size 1 (default)
-    
+
     The DataFrame should be sorted by length descending for this to work efficiently.
     """
 
@@ -413,46 +484,46 @@ class TokenBudgetBatchSampler(Sampler):
         """Compute total number of batches."""
         if not self.lengths:
             return 0
-        
+
         num_batches = 0
         batch_size = 0
-        current_max = float('inf')
-        
+        current_max = float("inf")
+
         for idx in self.indices:
             length = self.lengths[idx]
             allowed = self._get_max_batch_size(length)
-            
+
             # Start new batch if current batch is full
             if batch_size >= current_max:
                 num_batches += 1
                 batch_size = 0
                 current_max = allowed
-            
+
             batch_size += 1
             current_max = min(current_max, allowed)
-        
+
         if batch_size > 0:
             num_batches += 1
-        
+
         return num_batches
 
     def __iter__(self):
         batch = []
-        current_max = float('inf')
-        
+        current_max = float("inf")
+
         for idx in self.indices:
             length = self.lengths[idx]
             allowed = self._get_max_batch_size(length)
-            
+
             # Start new batch if current batch is full or max batch size decreased
             if len(batch) >= current_max:
                 yield batch
                 batch = []
                 current_max = allowed
-            
+
             batch.append(idx)
             current_max = min(current_max, allowed)
-        
+
         if batch and (not self.drop_last or len(batch) == current_max):
             yield batch
 
@@ -464,7 +535,10 @@ class TokenBudgetBatchSampler(Sampler):
 # Assistant Mask Verification
 # =============================================================================
 
-def verify_assistant_mask(tokenizer, sample_conversation: list[dict], chat_template: Optional[str] = None) -> dict:
+
+def verify_assistant_mask(
+    tokenizer, sample_conversation: list[dict], chat_template: Optional[str] = None
+) -> dict:
     """
     Verify the assistant mask correctly identifies generated tokens.
 
@@ -508,7 +582,11 @@ def verify_assistant_mask(tokenizer, sample_conversation: list[dict], chat_templ
     print(assistant_text[:500] + "..." if len(assistant_text) > 500 else assistant_text)
     print()
     print("--- Non-assistant text (should be prompt/template) ---")
-    print(non_assistant_text[:500] + "..." if len(non_assistant_text) > 500 else non_assistant_text)
+    print(
+        non_assistant_text[:500] + "..."
+        if len(non_assistant_text) > 500
+        else non_assistant_text
+    )
     print("=" * 60)
 
     # Sanity checks
@@ -516,7 +594,9 @@ def verify_assistant_mask(tokenizer, sample_conversation: list[dict], chat_templ
     if expected_response.strip() in assistant_text.strip():
         print("✅ Assistant mask correctly captures the assistant response")
     else:
-        print("⚠️ Warning: Assistant response may not be fully captured in assistant tokens")
+        print(
+            "⚠️ Warning: Assistant response may not be fully captured in assistant tokens"
+        )
 
     return result
 
@@ -530,6 +610,7 @@ UINT16_MAX = 65535
 
 def create_collate_fn(tokenizer, chat_template: Optional[str] = None):
     """Create a collate function for the DataLoader."""
+
     def collate_fn(batch):
         messages_list = [b[0] for b in batch]
         indexes = np.array([b[2] for b in batch], dtype=np.int64)
@@ -600,7 +681,9 @@ def process_batch(
             for think_id in think_token_ids:
                 is_not_think &= ~torch.isin(batch["input_ids"], think_id)
                 for shift in range(1, 4):  # Also exclude a few tokens after
-                    is_not_think &= ~torch.isin(batch["input_ids"].roll(shift), think_id)
+                    is_not_think &= ~torch.isin(
+                        batch["input_ids"].roll(shift), think_id
+                    )
             assistant_mask = assistant_mask & is_not_think
 
         # Get logits for assistant positions only
@@ -619,24 +702,27 @@ def process_batch(
 
         # Nucleus (top-p) sampling: extract top logits that accumulate to p probability
         N, vocab_size = probs.size()
-        
+
         # Sort probabilities in descending order
         sorted_probs, sorted_idx = torch.sort(probs, dim=-1, descending=True)
-        
+
         # Compute cumulative sum of sorted probabilities
         cumsum_probs = torch.cumsum(sorted_probs, dim=-1)
-        
+
         # Find the nucleus: tokens whose cumulative probability <= top_p
         # We use <= to include the token that pushes us over the threshold
         nucleus_mask = cumsum_probs <= config.top_p
-        
+
         # Always include at least the top token (in case top_p is very small)
         nucleus_mask[:, 0] = True
-        
+
         # Apply hard maximum constraint
-        position_mask = torch.arange(vocab_size, device=probs.device).expand(N, -1) < config.top_p_max_elements
+        position_mask = (
+            torch.arange(vocab_size, device=probs.device).expand(N, -1)
+            < config.top_p_max_elements
+        )
         nucleus_mask = nucleus_mask & position_mask
-        
+
         # Extract nucleus indices and values (variable length per row)
         nucleus_idx_list = []
         nucleus_vals_list = []
@@ -664,7 +750,7 @@ def process_batch(
         rest_sum = probs_rest.sum(dim=-1, keepdim=True)
 
         # Handle edge case where all probability is in nucleus
-        zero_rest = (rest_sum.squeeze(-1) < 1e-10)
+        zero_rest = rest_sum.squeeze(-1) < 1e-10
         if zero_rest.any():
             # For these rows, sample uniformly from tokens not in nucleus
             uniform_mask = ~nucleus_mask_vocab_order[zero_rest]
@@ -680,7 +766,9 @@ def process_batch(
         sampled_vals = logits.float().gather(-1, sampled_idx)
 
         # Quantize per-token with row-wise min/max
-        def quantize_tensor(vals: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        def quantize_tensor(
+            vals: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
             """Quantize values to uint16 with per-row min/max."""
             row_min = vals.min(dim=-1, keepdim=True).values
             row_max = vals.max(dim=-1, keepdim=True).values
@@ -689,7 +777,9 @@ def process_batch(
             quantized = scaled.clamp(0, UINT16_MAX).to(torch.int32)
             return quantized, row_min.squeeze(-1), row_max.squeeze(-1)
 
-        def quantize_numpy(vals: np.ndarray) -> tuple[np.ndarray, np.float32, np.float32]:
+        def quantize_numpy(
+            vals: np.ndarray,
+        ) -> tuple[np.ndarray, np.float32, np.float32]:
             """Quantize numpy array to uint16 with min/max."""
             row_min = np.float32(vals.min())
             row_max = np.float32(vals.max())
@@ -707,7 +797,7 @@ def process_batch(
             nucleus_quant_list.append(quant)
             nucleus_min_list.append(vmin)
             nucleus_max_list.append(vmax)
-        
+
         # Quantize sampled (fixed-length) - process as tensor
         samp_quant, samp_min, samp_max = quantize_tensor(sampled_vals)
         samp_quant = samp_quant.cpu().numpy().astype(np.uint16)
@@ -725,34 +815,57 @@ def process_batch(
                 continue
 
             end = offset + size
-            
+
             # Extract variable-length nucleus data for this sample
+            # Note: keeping as numpy arrays / lists of numpy arrays
             sample_nucleus_idx = nucleus_idx_list[offset:end]
             sample_nucleus_quant = nucleus_quant_list[offset:end]
             sample_nucleus_min = nucleus_min_list[offset:end]
             sample_nucleus_max = nucleus_max_list[offset:end]
-            
+
+            # Pack nucleus indices
+            sample_nucleus_idx_low = []
+            sample_nucleus_idx_high = []
+            for idx_arr in sample_nucleus_idx:
+                low, high = pack_indices(idx_arr)
+                sample_nucleus_idx_low.append(low)
+                sample_nucleus_idx_high.append(high)
+
             # Extract fixed-length sampled data for this sample
             sample_samp_idx = samp_idx_np[offset:end]
             sample_samp_quant = samp_quant[offset:end]
             sample_samp_min = samp_min[offset:end]
             sample_samp_max = samp_max[offset:end]
-            
-            results.append({
-                "index": int(indexes[i]),
-                "num_tokens": size,
-                # Nucleus (top-p) logits - variable length per token
-                "top_indices": [idx.tolist() for idx in sample_nucleus_idx],
-                "top_logits_quantized": [q.tolist() for q in sample_nucleus_quant],
-                "top_min": sample_nucleus_min,
-                "top_max": sample_nucleus_max,
-                # Sampled logits - fixed length
-                "sampled_indices": sample_samp_idx.tolist(),
-                "sampled_logits_quantized": sample_samp_quant.tolist(),
-                "sampled_min": sample_samp_min.tolist(),
-                "sampled_max": sample_samp_max.tolist(),
-                "logsumexp": lse_np[offset:end].tolist(),
-            })
+
+            # Pack sampled indices
+            sample_samp_idx_low = []
+            sample_samp_idx_high = []
+            for j in range(len(sample_samp_idx)):
+                low, high = pack_indices(sample_samp_idx[j])
+                sample_samp_idx_low.append(low)
+                sample_samp_idx_high.append(high)
+
+            results.append(
+                {
+                    "index": np.int32(indexes[i]),
+                    "num_tokens": np.int32(size),
+                    # Nucleus (top-p) logits
+                    "top_indices_low": sample_nucleus_idx_low,
+                    "top_indices_high": sample_nucleus_idx_high,
+                    "top_logits_quantized": sample_nucleus_quant,
+                    "top_min": sample_nucleus_min,
+                    "top_max": sample_nucleus_max,
+                    # Sampled logits
+                    "sampled_indices_low": sample_samp_idx_low,
+                    "sampled_indices_high": sample_samp_idx_high,
+                    "sampled_logits_quantized": [
+                        sample_samp_quant[j] for j in range(size)
+                    ],  # Convert 2D array to list of 1D arrays
+                    "sampled_min": [sample_samp_min[j] for j in range(size)],
+                    "sampled_max": [sample_samp_max[j] for j in range(size)],
+                    "logsumexp": [lse_np[j] for j in range(offset, end)],
+                }
+            )
             offset = end
 
     return results
@@ -762,8 +875,10 @@ def process_batch(
 # Dataset Preparation
 # =============================================================================
 
-def prepare_dataset(config: ExtractionConfig,
-                    skip_indices: set[int]) -> tuple[pd.DataFrame, list[int]]:
+
+def prepare_dataset(
+    config: ExtractionConfig, skip_indices: set[int]
+) -> tuple[pd.DataFrame, list[int]]:
     """
     Load and prepare the dataset for extraction.
 
@@ -784,7 +899,9 @@ def prepare_dataset(config: ExtractionConfig,
     # Load pre-computed lengths if available
     if config.tokenized_dataset_id and config.length_column:
         print(f"📏 Loading lengths from: {config.tokenized_dataset_id}")
-        length_ds = load_dataset(config.tokenized_dataset_id, split=config.dataset_split)
+        length_ds = load_dataset(
+            config.tokenized_dataset_id, split=config.dataset_split
+        )
         df["length"] = length_ds[config.length_column]
     elif config.length_column and config.length_column in df.columns:
         df["length"] = df[config.length_column]
@@ -801,8 +918,7 @@ def prepare_dataset(config: ExtractionConfig,
             def sample_group(group):
                 subject = group.name
                 n_samples = config.sample_per_subject.get(
-                    subject,
-                    config.sample_per_subject.get("*", len(group))
+                    subject, config.sample_per_subject.get("*", len(group))
                 )
                 actual = min(n_samples, len(group))
                 return group.sample(n=actual, random_state=random_state)
@@ -811,7 +927,9 @@ def prepare_dataset(config: ExtractionConfig,
                 sample_group, include_groups=True
             )
         else:
-            print(f"⚠️ Subject column '{config.subject_column}' not found, skipping sampling")
+            print(
+                f"⚠️ Subject column '{config.subject_column}' not found, skipping sampling"
+            )
 
     # Filter out already processed indices
     if skip_indices:
@@ -821,7 +939,7 @@ def prepare_dataset(config: ExtractionConfig,
 
     # Apply start offset
     if config.start_offset > 0:
-        df = df.iloc[config.start_offset:]
+        df = df.iloc[config.start_offset :]
         print(f"⏭️  Skipped first {config.start_offset} samples")
 
     # Apply limit if set
@@ -835,7 +953,9 @@ def prepare_dataset(config: ExtractionConfig,
         df = df[df["length"] <= config.max_seq_len]
         skipped = original_len - len(df)
         if skipped > 0:
-            print(f"⏭️  Skipped {skipped} samples longer than {config.max_seq_len} tokens")
+            print(
+                f"⏭️  Skipped {skipped} samples longer than {config.max_seq_len} tokens"
+            )
 
     # Sort by length descending for better batching
     if "length" in df.columns and df["length"].sum() > 0:
@@ -852,6 +972,7 @@ def prepare_dataset(config: ExtractionConfig,
 # Main Extraction Pipeline
 # =============================================================================
 
+
 def run_extraction(config: ExtractionConfig, verify_mask: bool = False):
     """
     Run the full extraction pipeline.
@@ -866,7 +987,9 @@ def run_extraction(config: ExtractionConfig, verify_mask: bool = False):
     print(f"Model: {config.model_id}")
     print(f"Dataset: {config.dataset_id}")
     print(f"Output: {config.hf_output_repo}")
-    print(f"Top-P: {config.top_p}, Max Elements: {config.top_p_max_elements}, Sampled-N: {config.sampled_n}")
+    print(
+        f"Top-P: {config.top_p}, Max Elements: {config.top_p_max_elements}, Sampled-N: {config.sampled_n}"
+    )
     print("=" * 60)
 
     # Initialize uploader
@@ -892,7 +1015,7 @@ def run_extraction(config: ExtractionConfig, verify_mask: bool = False):
     dtype_map = {
         "bfloat16": torch.bfloat16,
         "float16": torch.float16,
-        "float32": torch.float32
+        "float32": torch.float32,
     }
     model = AutoModelForCausalLM.from_pretrained(
         config.model_id,
@@ -904,7 +1027,7 @@ def run_extraction(config: ExtractionConfig, verify_mask: bool = False):
     model.eval()
     for param in model.parameters():
         param.requires_grad = False
-    
+
     tokenizer = AutoTokenizer.from_pretrained(config.model_id)
 
     if tokenizer.pad_token_id is None:
@@ -914,7 +1037,7 @@ def run_extraction(config: ExtractionConfig, verify_mask: bool = False):
     custom_chat_template = None
     if config.chat_template_file:
         print(f"📝 Loading custom chat template from: {config.chat_template_file}")
-        with open(config.chat_template_file, 'r') as f:
+        with open(config.chat_template_file, "r") as f:
             custom_chat_template = f.read()
         print("   ✅ Custom chat template loaded")
 
@@ -925,7 +1048,9 @@ def run_extraction(config: ExtractionConfig, verify_mask: bool = False):
         ids = tokenizer.encode(s, add_special_tokens=False)
         if ids:
             exclude_token_ids.extend(ids)
-    exclude_tokens = torch.tensor(exclude_token_ids, dtype=torch.long) if exclude_token_ids else None
+    exclude_tokens = (
+        torch.tensor(exclude_token_ids, dtype=torch.long) if exclude_token_ids else None
+    )
 
     # Get think token IDs for exclusion
     think_token_ids = []
@@ -933,7 +1058,9 @@ def run_extraction(config: ExtractionConfig, verify_mask: bool = False):
         ids = tokenizer.encode(tag, add_special_tokens=False)
         if ids:
             think_token_ids.extend(ids)
-    think_tokens_tensor = torch.tensor(think_token_ids, dtype=torch.long) if think_token_ids else None
+    think_tokens_tensor = (
+        torch.tensor(think_token_ids, dtype=torch.long) if think_token_ids else None
+    )
 
     # Prepare dataset
     df, lengths = prepare_dataset(config, skip_indices)
@@ -948,7 +1075,9 @@ def run_extraction(config: ExtractionConfig, verify_mask: bool = False):
             {"role": "user", "content": df.iloc[0][config.user_column]},
             {"role": "assistant", "content": df.iloc[0][config.assistant_column]},
         ]
-        verify_assistant_mask(tokenizer, sample_messages, chat_template=custom_chat_template)
+        verify_assistant_mask(
+            tokenizer, sample_messages, chat_template=custom_chat_template
+        )
         input("\nPress Enter to continue with extraction...")
 
     # Create dataset and dataloader
@@ -970,7 +1099,11 @@ def run_extraction(config: ExtractionConfig, verify_mask: bool = False):
         interrupt_handler.check_and_exit()
 
         results = process_batch(
-            model, tokenizer, batch, indexes, config,
+            model,
+            tokenizer,
+            batch,
+            indexes,
+            config,
             exclude_tokens=exclude_tokens,
             think_token_ids=think_tokens_tensor,
         )
@@ -983,10 +1116,12 @@ def run_extraction(config: ExtractionConfig, verify_mask: bool = False):
                 uploader.flush()
 
         pbar.update(batch["input_ids"].size(0))
-        pbar.set_postfix({
-            "buffer": len(uploader.buffer),
-            "uploaded": uploader.total_samples_uploaded
-        })
+        pbar.set_postfix(
+            {
+                "buffer": len(uploader.buffer),
+                "uploaded": uploader.total_samples_uploaded,
+            }
+        )
 
         # Periodic cleanup
         if (batch_idx + 1) % 1000 == 0:
@@ -1003,94 +1138,173 @@ def run_extraction(config: ExtractionConfig, verify_mask: bool = False):
 # CLI
 # =============================================================================
 
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Extract logits from a language model for knowledge distillation"
     )
-    parser.add_argument("--model", type=str, required=True,
-                        help="HuggingFace model ID")
-    parser.add_argument("--dataset", type=str, required=True,
-                        help="HuggingFace dataset ID")
-    parser.add_argument("--output", type=str, required=True,
-                        help="HuggingFace dataset repo for output")
+    parser.add_argument("--model", type=str, required=True, help="HuggingFace model ID")
+    parser.add_argument(
+        "--dataset", type=str, required=True, help="HuggingFace dataset ID"
+    )
+    parser.add_argument(
+        "--output", type=str, required=True, help="HuggingFace dataset repo for output"
+    )
 
     # Processing options
-    parser.add_argument("--split", type=str, default="train",
-                        help="Dataset split to use")
-    parser.add_argument("--top-p", type=float, default=0.98,
-                        help="Nucleus sampling threshold (cumulative probability)")
-    parser.add_argument("--top-p-max", type=int, default=100,
-                        help="Hard maximum number of elements for nucleus sampling")
-    parser.add_argument("--sampled-n", type=int, default=24,
-                        help="Number of additional logits to sample from remaining vocab")
+    parser.add_argument(
+        "--split", type=str, default="train", help="Dataset split to use"
+    )
+    parser.add_argument(
+        "--top-p",
+        type=float,
+        default=0.98,
+        help="Nucleus sampling threshold (cumulative probability)",
+    )
+    parser.add_argument(
+        "--top-p-max",
+        type=int,
+        default=100,
+        help="Hard maximum number of elements for nucleus sampling",
+    )
+    parser.add_argument(
+        "--sampled-n",
+        type=int,
+        default=24,
+        help="Number of additional logits to sample from remaining vocab",
+    )
 
     # Batch sizing - simple options
-    parser.add_argument("--batch-thresholds", type=str, default=None,
-                        help="JSON dict of length->samples_per_batch (e.g., '{\"1024\":4,\"512\":8}')")
-    parser.add_argument("--max-batch-size", type=int, default=None,
-                        help="Simple max batch size override (applies to all lengths)")
-    parser.add_argument("--max-seq-len", type=int, default=None,
-                        help="Skip samples longer than this (prevent OOM)")
+    parser.add_argument(
+        "--batch-thresholds",
+        type=str,
+        default=None,
+        help='JSON dict of length->samples_per_batch (e.g., \'{"1024":4,"512":8}\')',
+    )
+    parser.add_argument(
+        "--max-batch-size",
+        type=int,
+        default=None,
+        help="Simple max batch size override (applies to all lengths)",
+    )
+    parser.add_argument(
+        "--max-seq-len",
+        type=int,
+        default=None,
+        help="Skip samples longer than this (prevent OOM)",
+    )
 
     # Upload options
-    parser.add_argument("--upload-every", type=int, default=500,
-                        help="Upload to HF every N samples")
+    parser.add_argument(
+        "--upload-every", type=int, default=500, help="Upload to HF every N samples"
+    )
 
     # Model loading
-    parser.add_argument("--device", type=str, default="cuda",
-                        help="Device to load model on")
-    parser.add_argument("--dtype", type=str, default="bfloat16",
-                        help="Model dtype (bfloat16, float16, float32)")
-    parser.add_argument("--attn", type=str, default="flash_attention_2",
-                        help="Attention implementation")
+    parser.add_argument(
+        "--device", type=str, default="cuda", help="Device to load model on"
+    )
+    parser.add_argument(
+        "--dtype",
+        type=str,
+        default="bfloat16",
+        help="Model dtype (bfloat16, float16, float32)",
+    )
+    parser.add_argument(
+        "--attn", type=str, default="flash_attention_2", help="Attention implementation"
+    )
 
     # Dataset configuration
-    parser.add_argument("--user-col", type=str, default="question",
-                        help="Column name for user messages")
-    parser.add_argument("--assistant-col", type=str, default="answer",
-                        help="Column name for assistant messages")
-    parser.add_argument("--index-col", type=str, default=None,
-                        help="Column name for original index")
-    parser.add_argument("--subject-col", type=str, default=None,
-                        help="Column name for subject (for sampling)")
+    parser.add_argument(
+        "--user-col", type=str, default="question", help="Column name for user messages"
+    )
+    parser.add_argument(
+        "--assistant-col",
+        type=str,
+        default="answer",
+        help="Column name for assistant messages",
+    )
+    parser.add_argument(
+        "--index-col", type=str, default=None, help="Column name for original index"
+    )
+    parser.add_argument(
+        "--subject-col",
+        type=str,
+        default=None,
+        help="Column name for subject (for sampling)",
+    )
 
     # Pre-computed lengths
-    parser.add_argument("--length-col", type=str, default=None,
-                        help="Column name for pre-computed token lengths")
-    parser.add_argument("--tokenized-dataset", type=str, default=None,
-                        help="Dataset ID with pre-computed lengths")
+    parser.add_argument(
+        "--length-col",
+        type=str,
+        default=None,
+        help="Column name for pre-computed token lengths",
+    )
+    parser.add_argument(
+        "--tokenized-dataset",
+        type=str,
+        default=None,
+        help="Dataset ID with pre-computed lengths",
+    )
 
     # Sampling
-    parser.add_argument("--sample-subject", type=str, default=None,
-                        help="JSON dict of subject->n_samples (e.g., '{\"\":20000,\"*\":6000}')")
-    parser.add_argument("--limit", type=int, default=None,
-                        help="Limit total samples to process")
-    parser.add_argument("--start-offset", type=int, default=0,
-                        help="Skip first N samples")
-    parser.add_argument("--full-dataset", action="store_true",
-                        help="Process full dataset (no sampling)")
+    parser.add_argument(
+        "--sample-subject",
+        type=str,
+        default=None,
+        help='JSON dict of subject->n_samples (e.g., \'{"":20000,"*":6000}\')',
+    )
+    parser.add_argument(
+        "--limit", type=int, default=None, help="Limit total samples to process"
+    )
+    parser.add_argument(
+        "--start-offset", type=int, default=0, help="Skip first N samples"
+    )
+    parser.add_argument(
+        "--full-dataset", action="store_true", help="Process full dataset (no sampling)"
+    )
 
     # Token exclusion
-    parser.add_argument("--include-think", action="store_true",
-                        help="Include thinking tags in extraction")
-    parser.add_argument("--include-end", action="store_true",
-                        help="Include end-of-generation tokens in extraction")
+    parser.add_argument(
+        "--include-think",
+        action="store_true",
+        help="Include thinking tags in extraction",
+    )
+    parser.add_argument(
+        "--include-end",
+        action="store_true",
+        help="Include end-of-generation tokens in extraction",
+    )
 
     # Resume/continue
-    parser.add_argument("--resume", action="store_true",
-                        help="Resume from previous checkpoint")
-    parser.add_argument("--force-restart", action="store_true",
-                        help="Ignore existing progress and restart")
+    parser.add_argument(
+        "--resume", action="store_true", help="Resume from previous checkpoint"
+    )
+    parser.add_argument(
+        "--force-restart",
+        action="store_true",
+        help="Ignore existing progress and restart",
+    )
 
     # Other
-    parser.add_argument("--verify-mask", action="store_true",
-                        help="Verify assistant mask before extraction")
-    parser.add_argument("--seed", type=int, default=42,
-                        help="Random seed")
-    parser.add_argument("--cache-dir", type=str, default=".logit_extraction_cache",
-                        help="Local cache directory")
-    parser.add_argument("--chat-template", type=str, default=None,
-                        help="Path to custom chat template file (Jinja2 format with {% generation %} markers)")
+    parser.add_argument(
+        "--verify-mask",
+        action="store_true",
+        help="Verify assistant mask before extraction",
+    )
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument(
+        "--cache-dir",
+        type=str,
+        default=".logit_extraction_cache",
+        help="Local cache directory",
+    )
+    parser.add_argument(
+        "--chat-template",
+        type=str,
+        default=None,
+        help="Path to custom chat template file (Jinja2 format with {% generation %} markers)",
+    )
 
     return parser.parse_args()
 
@@ -1126,9 +1340,8 @@ def main():
         top_p=args.top_p,
         top_p_max_elements=args.top_p_max,
         sampled_n=args.sampled_n,
-        batch_budget_thresholds=batch_thresholds or {
-            8192: 1, 4096: 1, 2048: 2, 1024: 4, 512: 8, 256: 16
-        },
+        batch_budget_thresholds=batch_thresholds
+        or {8192: 1, 4096: 1, 2048: 2, 1024: 4, 512: 8, 256: 16},
         upload_every_n_samples=args.upload_every,
         device=args.device,
         torch_dtype=args.dtype,
