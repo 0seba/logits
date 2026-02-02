@@ -623,31 +623,34 @@ def process_batch(
         # Extract nucleus indices and values (variable length per row)
         nucleus_idx_list = []
         nucleus_vals_list = []
-        nucleus_mask_bool = []
-        
+
         for i in range(N):
             row_nucleus_mask = nucleus_mask[i]
             row_indices = sorted_idx[i][row_nucleus_mask]
             row_values = logits.float()[i][row_indices]
-            
+
             nucleus_idx_list.append(row_indices.cpu().numpy().astype(np.int32))
             nucleus_vals_list.append(row_values.cpu().numpy().astype(np.float32))
-            nucleus_mask_bool.append(row_nucleus_mask)
-        
-        # Create a mask for remaining vocabulary sampling
-        # Convert list of masks back to tensor
-        nucleus_mask_tensor = torch.stack(nucleus_mask_bool)
-        
+
+        # Create a mask for remaining vocabulary sampling in ORIGINAL vocab order
+        # We need to convert nucleus indices back to original vocabulary positions
+        nucleus_mask_vocab_order = torch.zeros_like(probs, dtype=torch.bool)
+        for i in range(N):
+            # Get the actual vocabulary indices that are in the nucleus
+            row_nucleus_indices = sorted_idx[i][nucleus_mask[i]]
+            # Mark these indices in the mask (in original vocab order)
+            nucleus_mask_vocab_order[i, row_nucleus_indices] = True
+
         # Sample additional tokens from remaining vocabulary (outside nucleus)
         probs_rest = probs.clone()
-        probs_rest[nucleus_mask_tensor] = 0.0
+        probs_rest[nucleus_mask_vocab_order] = 0.0
         rest_sum = probs_rest.sum(dim=-1, keepdim=True)
 
         # Handle edge case where all probability is in nucleus
         zero_rest = (rest_sum.squeeze(-1) < 1e-10)
         if zero_rest.any():
             # For these rows, sample uniformly from tokens not in nucleus
-            uniform_mask = ~nucleus_mask_tensor[zero_rest]
+            uniform_mask = ~nucleus_mask_vocab_order[zero_rest]
             counts = uniform_mask.sum(dim=-1, keepdim=True).float().clamp(min=1.0)
             probs_rest[zero_rest] = uniform_mask.float() / counts
 
