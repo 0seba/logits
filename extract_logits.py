@@ -125,6 +125,9 @@ class ExtractionConfig:
     # Local cache for checkpoints
     cache_dir: str = ".logit_extraction_cache"
 
+    # Custom chat template file
+    chat_template_file: Optional[str] = None
+
 
 # =============================================================================
 # Streaming HuggingFace Upload
@@ -886,6 +889,15 @@ def run_extraction(config: ExtractionConfig, verify_mask: bool = False):
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
+    # Load custom chat template if provided
+    custom_chat_template = None
+    if config.chat_template_file:
+        print(f"📝 Loading custom chat template from: {config.chat_template_file}")
+        with open(config.chat_template_file, 'r') as f:
+            custom_chat_template = f.read()
+        tokenizer.chat_template = custom_chat_template
+        print("   ✅ Custom chat template loaded")
+
     # Get special tokens to exclude
     end_token_strs = ["<|im_end|>", "<|endoftext|>"]
     exclude_token_ids = []
@@ -1057,6 +1069,8 @@ def parse_args():
                         help="Random seed")
     parser.add_argument("--cache-dir", type=str, default=".logit_extraction_cache",
                         help="Local cache directory")
+    parser.add_argument("--chat-template", type=str, default=None,
+                        help="Path to custom chat template file (Jinja2 format with {% generation %} markers)")
 
     return parser.parse_args()
 
@@ -1115,6 +1129,7 @@ def main():
         resume=args.resume,
         force_restart=args.force_restart,
         cache_dir=args.cache_dir,
+        chat_template_file=args.chat_template,
     )
 
     run_extraction(config, verify_mask=args.verify_mask)
