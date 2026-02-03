@@ -187,6 +187,32 @@ def main():
 
     if args.streaming:
         print("Processing in streaming mode...")
+
+        # Try to get total samples for progress bar
+        total_samples = None
+        try:
+            # Attempt to get dataset info if available
+            if hasattr(ds, "info") and ds.info.splits:
+                if args.split in ds.info.splits:
+                    total_samples = ds.info.splits[args.split].num_examples
+
+            # If standard info access fails, sometimes we can look at the builder info
+            if (
+                total_samples is None
+                and hasattr(ds, "_builder_info")
+                and ds._builder_info
+            ):
+                if (
+                    hasattr(ds._builder_info, "splits")
+                    and args.split in ds._builder_info.splits
+                ):
+                    total_samples = ds._builder_info.splits[args.split].num_examples
+
+            if total_samples:
+                print(f"Est. total samples: {total_samples}")
+        except Exception:
+            pass
+
         # For streaming, we iterate and process in batches manually or via map
         # map() on iterable dataset applies function lazily
         mapped_ds = ds.map(transform_fn, batched=True, batch_size=args.batch_size)
@@ -200,7 +226,12 @@ def main():
 
         # We define a generator that yields the computed lengths
         def result_gen():
-            for row in tqdm(mapped_ds, desc="Computing lengths"):
+            for row in tqdm(
+                mapped_ds,
+                desc="Computing lengths",
+                total=total_samples,
+                unit=" samples",
+            ):
                 yield {"length": row["length"]}
 
         # Create a new dataset from generator (caches to arrow/parquet)
@@ -212,7 +243,12 @@ def main():
         # Even 1B rows is 4GB. Most datasets are smaller.
 
         lengths = []
-        for row in tqdm(mapped_ds, desc="Streaming & Computing"):
+        for row in tqdm(
+            mapped_ds,
+            desc="Streaming & Computing",
+            total=total_samples,
+            unit=" samples",
+        ):
             lengths.append(row["length"])
 
         result_ds = Dataset.from_dict({"length": lengths})

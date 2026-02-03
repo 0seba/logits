@@ -174,6 +174,12 @@ class ExtractionConfig:
     # Custom chat template file
     chat_template_file: Optional[str] = None
 
+    # Sampling Method
+    random_sample: bool = False
+
+    # Sampling Method
+    random_sample: bool = False
+
 
 # =============================================================================
 # Streaming HuggingFace Upload
@@ -358,7 +364,10 @@ class StreamingHFUploader:
 
         # Then, verify against HuggingFace dataset
         try:
-            ds = load_dataset(self.repo_id, split="train", streaming=True)
+            # OPTIMIZATION: Only fetch index column
+            ds = load_dataset(
+                self.repo_id, split="train", streaming=True
+            ).select_columns(["index"])
             hf_indices = set()
             for row in tqdm(ds, desc="Verifying HF dataset"):
                 hf_indices.add(row["index"])
@@ -919,27 +928,58 @@ def prepare_dataset(
         # Mark for length computation during iteration
         df["length"] = 0
 
-    # Apply stratified sampling if configured
-    if config.sample_per_subject and config.subject_column:
+    # Apply stratified sampling/limiting if configured
+    if config.subject_column:
         if config.subject_column in df.columns:
-            print(f"🎲 Applying sampling by {config.subject_column}")
-            random_state = np.random.Generator(PCG64(seed=config.seed))
+            print(f"🎲 Applying group-based limits by {config.subject_column}")
 
-            def sample_group(group):
+            # Determine limits per group
+            # If sample_per_subject is provided, use it.
+            # Otherwise if limit_samples is provided, use it as limit PER GROUP.
+
+            def apply_group_limit(group):
                 subject = group.name
-                n_samples = config.sample_per_subject.get(
-                    subject, config.sample_per_subject.get("*", len(group))
-                )
-                actual = min(n_samples, len(group))
-                return group.sample(n=actual, random_state=random_state)
+                limit = None
 
+                if config.sample_per_subject:
+                    limit = config.sample_per_subject.get(
+                        subject, config.sample_per_subject.get("*", None)
+                    )
+
+                if limit is None and config.limit_samples:
+                    limit = config.limit_samples
+
+                if limit is not None and len(group) > limit:
+                    if config.random_sample:
+                        # Use reproducible random sampling
+                        rng = np.random.default_rng(config.seed)
+                        # Simple random selection of indices from this group
+                        indices = rng.choice(len(group), size=limit, replace=False)
+                        return group.iloc[indices]
+                    else:
+                        return group.head(limit)
+                return group
+
+            # Apply limits
             df = df.groupby(config.subject_column, group_keys=False).apply(
-                sample_group, include_groups=True
+                apply_group_limit, include_groups=True
             )
+
+            # Report counts per group
+            print("\n📊 Samples per group:")
+            counts = df[config.subject_column].value_counts().sort_index()
+            for subject, count in counts.items():
+                print(f"   - {subject}: {count}")
+            print(f"   Total: {len(df)}\n")
+
         else:
             print(
-                f"⚠️ Subject column '{config.subject_column}' not found, skipping sampling"
+                f"⚠️ Subject column '{config.subject_column}' not found, skipping group limits"
             )
+            # Fallback to global limit if subject col missing
+            if config.limit_samples:
+                df = df.head(config.limit_samples)
+                print(f"🔢 Limiting to {len(df)} samples (global)")
 
     # Filter out already processed indices
     if skip_indices:
@@ -947,15 +987,28 @@ def prepare_dataset(
         df = df[~df["original_index"].isin(skip_indices)]
         print(f"⏭️  Skipping {original_len - len(df)} already processed samples")
 
-    # Apply start offset
+    # Apply start offset (only if not doing group limits, or applied after?)
+    # Usually start offset is for global restart.
     if config.start_offset > 0:
         df = df.iloc[config.start_offset :]
         print(f"⏭️  Skipped first {config.start_offset} samples")
 
-    # Apply limit if set
-    if config.limit_samples:
-        df = df.head(config.limit_samples)
-        print(f"🔢 Limiting to {len(df)} samples")
+    # Limit global samples if NO subject column was used (or if explicit global limit needed?)
+    # The requirement says "limit applies to the number of examples per group".
+    # If subject column IS NOT present, we use limit_samples as global limit.
+    if config.limit_samples and not config.subject_column:
+        if len(df) > config.limit_samples:
+            if config.random_sample:
+                print(f"🎲 Randomly sampling {config.limit_samples} samples")
+                df = df.sample(
+                    n=config.limit_samples,
+                    random_state=np.random.RandomState(config.seed),
+                )
+            else:
+                df = df.head(config.limit_samples)
+                print(f"🔢 Limiting to {len(df)} samples")
+        else:
+            print(f"🔢 Limiting to {len(df)} samples")
 
     # Filter out samples that are too long
     if config.max_seq_len and "length" in df.columns:
@@ -1273,6 +1326,11 @@ def parse_args():
     parser.add_argument(
         "--full-dataset", action="store_true", help="Process full dataset (no sampling)"
     )
+    parser.add_argument(
+        "--random-sample",
+        action="store_true",
+        help="Randomly sample instead of taking first N (applies to global or group limits)",
+    )
 
     # Token exclusion
     parser.add_argument(
@@ -1313,7 +1371,7 @@ def parse_args():
         "--chat-template",
         type=str,
         default=None,
-        help="Path to custom chat template file (Jinja2 format with {% generation %} markers)",
+        help="Path to custom chat template file (Jinja2 format with {%% generation %%} markers)",
     )
 
     return parser.parse_args()
@@ -1373,6 +1431,7 @@ def main():
         force_restart=args.force_restart,
         cache_dir=args.cache_dir,
         chat_template_file=args.chat_template,
+        random_sample=args.random_sample,
     )
 
     run_extraction(config, verify_mask=args.verify_mask)
