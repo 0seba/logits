@@ -30,12 +30,15 @@ Usage:
 
 from dataclasses import dataclass, field
 from typing import Optional
+from concurrent.futures import ThreadPoolExecutor
 import argparse
 import io
 import json
 import os
 import signal
 import sys
+import threading
+import time
 
 import numpy as np
 import pandas as pd
@@ -48,6 +51,29 @@ from numpy.random import PCG64
 from torch.utils.data import DataLoader, Dataset, Sampler
 from tqdm.auto import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
+
+
+# =============================================================================
+# Timing Metrics
+# =============================================================================
+
+
+@dataclass
+class BatchTimingMetrics:
+    """Timing metrics for a single batch."""
+    num_tokens: int = 0
+    model_time_ms: float = 0.0
+    postprocess_time_ms: float = 0.0
+
+    @property
+    def model_tokens_per_sec(self) -> float:
+        if self.model_time_ms > 0:
+            return self.num_tokens / (self.model_time_ms / 1000.0)
+        return 0.0
+
+    @property
+    def total_time_ms(self) -> float:
+        return self.model_time_ms + self.postprocess_time_ms
 
 
 # =============================================================================
@@ -173,9 +199,6 @@ class ExtractionConfig:
 
     # Custom chat template file
     chat_template_file: Optional[str] = None
-
-    # Sampling Method
-    random_sample: bool = False
 
     # Sampling Method
     random_sample: bool = False
@@ -636,33 +659,48 @@ def create_collate_fn(tokenizer, chat_template: Optional[str] = None):
     return collate_fn
 
 
-def process_batch(
+@dataclass
+class GPUBatchResult:
+    """Intermediate GPU results for async CPU post-processing."""
+    # Nucleus data (on CPU after transfer)
+    nucleus_indices: np.ndarray  # (total_tokens, top_p_max) padded
+    nucleus_logits: np.ndarray   # (total_tokens, top_p_max) padded
+    nucleus_counts: np.ndarray   # (total_tokens,) actual count per token
+    nucleus_min: np.ndarray      # (total_tokens,)
+    nucleus_max: np.ndarray      # (total_tokens,)
+    # Sampled data (on CPU after transfer)
+    sampled_indices: np.ndarray  # (total_tokens, sampled_n)
+    sampled_logits: np.ndarray   # (total_tokens, sampled_n) quantized
+    sampled_min: np.ndarray      # (total_tokens,)
+    sampled_max: np.ndarray      # (total_tokens,)
+    # Other
+    logsumexp: np.ndarray        # (total_tokens,)
+    sizes: list[int]             # tokens per sample in batch
+    indexes: np.ndarray          # original dataset indices
+
+
+def gpu_process_batch(
     model,
-    tokenizer,
     batch: dict,
     indexes: np.ndarray,
     config: ExtractionConfig,
     exclude_tokens: Optional[torch.Tensor] = None,
     think_token_ids: Optional[torch.Tensor] = None,
-) -> Optional[list[dict]]:
+) -> tuple[Optional[GPUBatchResult], BatchTimingMetrics]:
     """
-    Process a batch and extract logits.
-
-    Args:
-        model: The language model
-        tokenizer: The tokenizer
-        batch: Tokenized batch with input_ids, attention_mask, assistant_masks
-        indexes: Original dataset indices for each sample in batch
-        config: Extraction configuration
-        exclude_tokens: Token IDs to exclude from extraction (e.g., <|im_end|>)
-        think_token_ids: Token IDs for thinking tags to exclude
+    GPU-optimized batch processing. All heavy computation on GPU, single CPU transfer.
 
     Returns:
-        List of sample dicts ready for upload, or None if nothing to extract
+        (GPUBatchResult for CPU post-processing, timing metrics)
     """
     device = next(model.parameters()).device
+    metrics = BatchTimingMetrics()
 
-    # CRITICAL: Disable gradient computation to save memory
+    # Start timing model forward pass
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    model_start = time.perf_counter()
+
     with torch.no_grad():
         # Forward pass to get hidden states
         outputs = model.model(
@@ -673,221 +711,291 @@ def process_batch(
         hidden_states = outputs.last_hidden_state
 
         # Build extraction mask from assistant_masks
-        assistant_mask = batch["assistant_masks"].bool()
+        assistant_mask = batch["assistant_masks"].bool().to(device)
 
         # Exclude end-of-generation tokens if configured
         if config.exclude_end_tokens and exclude_tokens is not None:
+            exclude_tokens = exclude_tokens.to(device)
             is_not_after_special = ~torch.isin(
-                batch["input_ids"].roll(1), exclude_tokens
+                batch["input_ids"].to(device).roll(1), exclude_tokens
             )
             assistant_mask = assistant_mask & is_not_after_special
 
         # Exclude thinking tag positions if configured
         if config.exclude_think_tags and think_token_ids is not None:
-            is_not_think = torch.ones_like(batch["input_ids"], dtype=torch.bool)
+            think_token_ids = think_token_ids.to(device)
+            input_ids_device = batch["input_ids"].to(device)
+            is_not_think = torch.ones_like(input_ids_device, dtype=torch.bool)
             for think_id in think_token_ids:
-                is_not_think &= ~torch.isin(batch["input_ids"], think_id)
-                for shift in range(1, 4):  # Also exclude a few tokens after
-                    is_not_think &= ~torch.isin(
-                        batch["input_ids"].roll(shift), think_id
-                    )
+                is_not_think &= ~torch.isin(input_ids_device, think_id)
+                for shift in range(1, 4):
+                    is_not_think &= ~torch.isin(input_ids_device.roll(shift), think_id)
             assistant_mask = assistant_mask & is_not_think
 
         # Get logits for assistant positions only
         extract_positions = assistant_mask.nonzero(as_tuple=True)
-        if extract_positions[0].numel() == 0:
-            return None
+        N = extract_positions[0].numel()
+        if N == 0:
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            metrics.model_time_ms = (time.perf_counter() - model_start) * 1000
+            return None, metrics
 
         logits = model.lm_head(hidden_states[extract_positions])  # (N, vocab)
+        metrics.num_tokens = N
 
         # Compute logsumexp for normalization info
-        lse = torch.logsumexp(logits.float(), dim=-1, keepdim=True)
-        probs = torch.exp(logits.float() - lse)
+        logits_f = logits.float()
+        lse = torch.logsumexp(logits_f, dim=-1)
+        probs = torch.exp(logits_f - lse.unsqueeze(-1))
 
         # Count tokens per sample in batch
         sizes = assistant_mask.sum(dim=-1).tolist()
 
-        # Nucleus (top-p) sampling: extract top logits that accumulate to p probability
-        N, vocab_size = probs.size()
+        # =====================================================================
+        # VECTORIZED NUCLEUS EXTRACTION (no Python loops!)
+        # =====================================================================
+        vocab_size = probs.size(-1)
 
         # Sort probabilities in descending order
         sorted_probs, sorted_idx = torch.sort(probs, dim=-1, descending=True)
 
-        # Compute cumulative sum of sorted probabilities
+        # Compute cumulative sum
         cumsum_probs = torch.cumsum(sorted_probs, dim=-1)
 
-        # Find the nucleus: tokens whose cumulative probability <= top_p
-        # We use <= to include the token that pushes us over the threshold
+        # Find nucleus mask: cumsum <= top_p, with position limit
         nucleus_mask = cumsum_probs <= config.top_p
-
-        # Always include at least the top token (in case top_p is very small)
-        nucleus_mask[:, 0] = True
+        nucleus_mask[:, 0] = True  # Always include top token
 
         # Apply hard maximum constraint
-        position_mask = (
-            torch.arange(vocab_size, device=probs.device).expand(N, -1)
-            < config.top_p_max_elements
-        )
+        position_indices = torch.arange(vocab_size, device=device)
+        position_mask = position_indices < config.top_p_max_elements
         nucleus_mask = nucleus_mask & position_mask
 
-        # Extract nucleus indices and values (variable length per row)
-        nucleus_idx_list = []
-        nucleus_vals_list = []
+        # Count elements in nucleus per row (vectorized)
+        nucleus_counts = nucleus_mask.sum(dim=-1)  # (N,)
 
-        for i in range(N):
-            row_nucleus_mask = nucleus_mask[i]
-            row_indices = sorted_idx[i][row_nucleus_mask]
-            row_values = logits.float()[i][row_indices]
+        # Extract top-k elements where k = top_p_max_elements (padded)
+        # This is much faster than variable-length extraction
+        k = config.top_p_max_elements
+        top_indices = sorted_idx[:, :k]  # (N, k) - original vocab indices
+        top_logits = logits_f.gather(-1, top_indices)  # (N, k)
 
-            nucleus_idx_list.append(row_indices.cpu().numpy().astype(np.int32))
-            nucleus_vals_list.append(row_values.cpu().numpy().astype(np.float32))
+        # Quantize nucleus logits on GPU (vectorized per-row)
+        top_min = top_logits.min(dim=-1).values  # (N,)
+        top_max = top_logits.max(dim=-1).values  # (N,)
+        top_range = (top_max - top_min).clamp(min=1e-10)
+        top_scaled = ((top_logits - top_min.unsqueeze(-1)) / top_range.unsqueeze(-1) * UINT16_MAX).round()
+        top_quantized = top_scaled.clamp(0, UINT16_MAX).to(torch.int32)
 
-        # Create a mask for remaining vocabulary sampling in ORIGINAL vocab order
-        # We need to convert nucleus indices back to original vocabulary positions
-        nucleus_mask_vocab_order = torch.zeros_like(probs, dtype=torch.bool)
-        for i in range(N):
-            # Get the actual vocabulary indices that are in the nucleus
-            row_nucleus_indices = sorted_idx[i][nucleus_mask[i]]
-            # Mark these indices in the mask (in original vocab order)
-            nucleus_mask_vocab_order[i, row_nucleus_indices] = True
+        # =====================================================================
+        # VECTORIZED SAMPLING FROM REMAINING VOCAB
+        # =====================================================================
+        # Create mask in vocab order using scatter (vectorized, no loop!)
+        nucleus_mask_vocab = torch.zeros(N, vocab_size, dtype=torch.bool, device=device)
+        # Create row indices for scatter
+        row_idx = torch.arange(N, device=device).unsqueeze(1).expand(-1, k)
+        # Only mark positions within actual nucleus count
+        col_mask = torch.arange(k, device=device).unsqueeze(0) < nucleus_counts.unsqueeze(1)
+        # Use advanced indexing to set True values
+        valid_rows = row_idx[col_mask]
+        valid_cols = top_indices[col_mask]
+        nucleus_mask_vocab[valid_rows, valid_cols] = True
 
-        # Sample additional tokens from remaining vocabulary (outside nucleus)
+        # Prepare sampling distribution
         probs_rest = probs.clone()
-        probs_rest[nucleus_mask_vocab_order] = 0.0
+        probs_rest[nucleus_mask_vocab] = 0.0
         rest_sum = probs_rest.sum(dim=-1, keepdim=True)
 
-        # Handle edge case where all probability is in nucleus
+        # Handle edge case: all probability in nucleus
         zero_rest = rest_sum.squeeze(-1) < 1e-10
         if zero_rest.any():
-            # For these rows, sample uniformly from tokens not in nucleus
-            uniform_mask = ~nucleus_mask_vocab_order[zero_rest]
+            uniform_mask = ~nucleus_mask_vocab[zero_rest]
             counts = uniform_mask.sum(dim=-1, keepdim=True).float().clamp(min=1.0)
             probs_rest[zero_rest] = uniform_mask.float() / counts
+            rest_sum = probs_rest.sum(dim=-1, keepdim=True)
 
-        # Renormalize remaining probabilities
-        rest_sum = probs_rest.sum(dim=-1, keepdim=True).clamp(min=1e-30)
-        probs_rest = probs_rest / rest_sum
+        # Renormalize
+        probs_rest = probs_rest / rest_sum.clamp(min=1e-30)
 
         # Sample from remaining distribution
         sampled_idx = torch.multinomial(probs_rest, config.sampled_n)
-        sampled_vals = logits.float().gather(-1, sampled_idx)
+        sampled_logits = logits_f.gather(-1, sampled_idx)
 
-        # Quantize per-token with row-wise min/max
-        def quantize_tensor(
-            vals: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-            """Quantize values to uint16 with per-row min/max."""
-            row_min = vals.min(dim=-1, keepdim=True).values
-            row_max = vals.max(dim=-1, keepdim=True).values
-            denom = (row_max - row_min).clamp(min=1e-10)
-            scaled = ((vals - row_min) / denom * UINT16_MAX).round()
-            quantized = scaled.clamp(0, UINT16_MAX).to(torch.int32)
-            return quantized, row_min.squeeze(-1), row_max.squeeze(-1)
+        # Quantize sampled logits on GPU
+        samp_min = sampled_logits.min(dim=-1).values
+        samp_max = sampled_logits.max(dim=-1).values
+        samp_range = (samp_max - samp_min).clamp(min=1e-10)
+        samp_scaled = ((sampled_logits - samp_min.unsqueeze(-1)) / samp_range.unsqueeze(-1) * UINT16_MAX).round()
+        samp_quantized = samp_scaled.clamp(0, UINT16_MAX).to(torch.int32)
 
-        def quantize_numpy(
-            vals: np.ndarray,
-        ) -> tuple[np.ndarray, np.float32, np.float32]:
-            """Quantize numpy array to uint16 with min/max."""
-            row_min = np.float32(vals.min())
-            row_max = np.float32(vals.max())
-            denom = max(row_max - row_min, 1e-10)
-            scaled = ((vals - row_min) / denom * UINT16_MAX).round()
-            quantized = scaled.clip(0, UINT16_MAX).astype(np.uint16)
-            return quantized, row_min, row_max
+        # Synchronize and record model time
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        metrics.model_time_ms = (time.perf_counter() - model_start) * 1000
 
-        # Quantize nucleus (variable-length) - already in numpy format
-        nucleus_quant_list = []
-        nucleus_min_list = []
-        nucleus_max_list = []
-        for vals in nucleus_vals_list:
-            quant, vmin, vmax = quantize_numpy(vals)
-            nucleus_quant_list.append(quant)
-            nucleus_min_list.append(vmin)
-            nucleus_max_list.append(vmax)
+        # =====================================================================
+        # SINGLE BATCHED CPU TRANSFER
+        # =====================================================================
+        # Transfer all tensors to CPU in one batch (more efficient)
+        result = GPUBatchResult(
+            nucleus_indices=top_indices.cpu().numpy().astype(np.int32),
+            nucleus_logits=top_quantized.cpu().numpy().astype(np.uint16),
+            nucleus_counts=nucleus_counts.cpu().numpy().astype(np.uint8),
+            nucleus_min=top_min.cpu().numpy().astype(np.float32),
+            nucleus_max=top_max.cpu().numpy().astype(np.float32),
+            sampled_indices=sampled_idx.cpu().numpy().astype(np.int32),
+            sampled_logits=samp_quantized.cpu().numpy().astype(np.uint16),
+            sampled_min=samp_min.cpu().numpy().astype(np.float32),
+            sampled_max=samp_max.cpu().numpy().astype(np.float32),
+            logsumexp=lse.cpu().numpy().astype(np.float32),
+            sizes=sizes,
+            indexes=indexes,
+        )
 
-        # Quantize sampled (fixed-length) - process as tensor
-        samp_quant, samp_min, samp_max = quantize_tensor(sampled_vals)
-        samp_quant = samp_quant.cpu().numpy().astype(np.uint16)
-        samp_idx_np = sampled_idx.cpu().numpy().astype(np.int32)
-        samp_min = samp_min.cpu().numpy().astype(np.float32)
-        samp_max = samp_max.cpu().numpy().astype(np.float32)
+    return result, metrics
 
-        lse_np = lse.squeeze(-1).cpu().numpy().astype(np.float32)
 
-        # Split by sample and create output dicts
-        results = []
-        offset = 0
-        for i, size in enumerate(sizes):
-            if size == 0:
-                continue
+def cpu_postprocess_batch(gpu_result: GPUBatchResult, config: ExtractionConfig) -> list[dict]:
+    """
+    CPU post-processing: pack indices and create final sample dicts.
 
-            end = offset + size
+    This runs on CPU and can be overlapped with GPU processing of next batch.
+    """
+    results = []
+    offset = 0
 
-            # Extract variable-length nucleus data for this sample
-            sample_nucleus_idx = nucleus_idx_list[offset:end]
-            sample_nucleus_quant = nucleus_quant_list[offset:end]
-            sample_nucleus_min = nucleus_min_list[offset:end]
-            sample_nucleus_max = nucleus_max_list[offset:end]
+    for i, size in enumerate(gpu_result.sizes):
+        if size == 0:
+            continue
 
-            # Flatten nucleus data
-            if len(sample_nucleus_idx) > 0:
-                flat_nucleus_idx = np.concatenate(sample_nucleus_idx)
-                flat_nucleus_quant = np.concatenate(sample_nucleus_quant)
-                # Ensure counts are within uint8 (max 255 elements)
-                top_counts = np.array(
-                    [len(x) for x in sample_nucleus_idx], dtype=np.uint8
-                )
+        end = offset + size
 
-                # Pack flattened indices
-                nucleus_low, nucleus_high_bytes = pack_indices(flat_nucleus_idx)
-            else:
-                flat_nucleus_idx = np.array([], dtype=np.int32)
-                nucleus_low = np.array([], dtype=np.uint16)
-                nucleus_high_bytes = b""
-                top_counts = np.array([], dtype=np.uint8)
-                flat_nucleus_quant = np.array([], dtype=np.uint16)
+        # Extract this sample's nucleus data
+        sample_nucleus_idx = gpu_result.nucleus_indices[offset:end]  # (size, k)
+        sample_nucleus_quant = gpu_result.nucleus_logits[offset:end]  # (size, k)
+        sample_nucleus_counts = gpu_result.nucleus_counts[offset:end]  # (size,)
+        sample_nucleus_min = gpu_result.nucleus_min[offset:end]  # (size,)
+        sample_nucleus_max = gpu_result.nucleus_max[offset:end]  # (size,)
 
-            # Extract fixed-length sampled data for this sample
-            sample_samp_idx = samp_idx_np[offset:end]
-            sample_samp_quant = samp_quant[offset:end]
-            sample_samp_min = samp_min[offset:end]
-            sample_samp_max = samp_max[offset:end]
+        # Flatten only valid nucleus elements (using counts)
+        flat_nucleus_idx_parts = []
+        flat_nucleus_quant_parts = []
+        for j in range(size):
+            cnt = sample_nucleus_counts[j]
+            flat_nucleus_idx_parts.append(sample_nucleus_idx[j, :cnt])
+            flat_nucleus_quant_parts.append(sample_nucleus_quant[j, :cnt])
 
-            # Flatten sampled data
-            if len(sample_samp_idx) > 0:
-                flat_samp_idx = sample_samp_idx.flatten()
-                flat_samp_quant = sample_samp_quant.flatten()
+        if flat_nucleus_idx_parts:
+            flat_nucleus_idx = np.concatenate(flat_nucleus_idx_parts)
+            flat_nucleus_quant = np.concatenate(flat_nucleus_quant_parts)
+            nucleus_low, nucleus_high_bytes = pack_indices(flat_nucleus_idx)
+        else:
+            nucleus_low = np.array([], dtype=np.uint16)
+            nucleus_high_bytes = b""
+            flat_nucleus_quant = np.array([], dtype=np.uint16)
 
-                # Pack flattened indices
-                samp_low, samp_high_bytes = pack_indices(flat_samp_idx)
-            else:
-                samp_low = np.array([], dtype=np.uint16)
-                samp_high_bytes = b""
-                flat_samp_quant = np.array([], dtype=np.uint16)
+        # Extract this sample's sampled data
+        sample_samp_idx = gpu_result.sampled_indices[offset:end]  # (size, sampled_n)
+        sample_samp_quant = gpu_result.sampled_logits[offset:end]
+        sample_samp_min = gpu_result.sampled_min[offset:end]
+        sample_samp_max = gpu_result.sampled_max[offset:end]
 
-            results.append(
-                {
-                    "index": np.int32(indexes[i]),
-                    "num_tokens": np.int32(size),
-                    # Nucleus (flattened)
-                    "top_indices_low": nucleus_low,
-                    "top_indices_high": nucleus_high_bytes,
-                    "top_logits_quantized": flat_nucleus_quant,
-                    "top_counts": top_counts,
-                    "top_min": sample_nucleus_min,
-                    "top_max": sample_nucleus_max,
-                    # Sampled (flattened)
-                    "sampled_indices_low": samp_low,
-                    "sampled_indices_high": samp_high_bytes,
-                    "sampled_logits_quantized": flat_samp_quant,
-                    # No counts needed for sampled (fixed stride = sampled_n)
-                    "sampled_min": sample_samp_min.tolist(),  # List of scalars
-                    "sampled_max": sample_samp_max.tolist(),  # List of scalars
-                    "logsumexp": [lse_np[j] for j in range(offset, end)],
-                }
-            )
-            offset = end
+        # Flatten sampled data
+        flat_samp_idx = sample_samp_idx.flatten()
+        flat_samp_quant = sample_samp_quant.flatten()
+        samp_low, samp_high_bytes = pack_indices(flat_samp_idx)
+
+        results.append({
+            "index": np.int32(gpu_result.indexes[i]),
+            "num_tokens": np.int32(size),
+            # Nucleus (flattened)
+            "top_indices_low": nucleus_low,
+            "top_indices_high": nucleus_high_bytes,
+            "top_logits_quantized": flat_nucleus_quant,
+            "top_counts": sample_nucleus_counts,
+            "top_min": sample_nucleus_min.tolist(),
+            "top_max": sample_nucleus_max.tolist(),
+            # Sampled (flattened)
+            "sampled_indices_low": samp_low,
+            "sampled_indices_high": samp_high_bytes,
+            "sampled_logits_quantized": flat_samp_quant,
+            "sampled_min": sample_samp_min.tolist(),
+            "sampled_max": sample_samp_max.tolist(),
+            "logsumexp": gpu_result.logsumexp[offset:end].tolist(),
+        })
+        offset = end
+
     return results
+
+
+class AsyncPostProcessor:
+    """Handles async CPU post-processing while GPU works on next batch."""
+
+    def __init__(self, max_workers: int = 2):
+        self.executor = ThreadPoolExecutor(max_workers=max_workers)
+        self.pending_future = None
+        self.pending_metrics: Optional[BatchTimingMetrics] = None
+
+    def submit(self, gpu_result: GPUBatchResult, config: ExtractionConfig, metrics: BatchTimingMetrics):
+        """Submit GPU result for async CPU post-processing."""
+        # Wait for any previous pending work first
+        results = self.get_results()
+
+        # Submit new work
+        self.pending_future = self.executor.submit(
+            self._process_with_timing, gpu_result, config, metrics
+        )
+        self.pending_metrics = metrics
+
+        return results
+
+    def _process_with_timing(
+        self, gpu_result: GPUBatchResult, config: ExtractionConfig, metrics: BatchTimingMetrics
+    ) -> tuple[list[dict], BatchTimingMetrics]:
+        """Process and record timing."""
+        start = time.perf_counter()
+        results = cpu_postprocess_batch(gpu_result, config)
+        metrics.postprocess_time_ms = (time.perf_counter() - start) * 1000
+        return results, metrics
+
+    def get_results(self) -> Optional[tuple[list[dict], BatchTimingMetrics]]:
+        """Get results from pending work, if any."""
+        if self.pending_future is None:
+            return None
+
+        results, metrics = self.pending_future.result()
+        self.pending_future = None
+        self.pending_metrics = None
+        return results, metrics
+
+    def flush(self) -> Optional[tuple[list[dict], BatchTimingMetrics]]:
+        """Flush any remaining pending work."""
+        return self.get_results()
+
+    def shutdown(self):
+        """Shutdown the executor."""
+        self.executor.shutdown(wait=True)
+
+
+def process_batch(
+    model,
+    tokenizer,
+    batch: dict,
+    indexes: np.ndarray,
+    config: ExtractionConfig,
+    exclude_tokens: Optional[torch.Tensor] = None,
+    think_token_ids: Optional[torch.Tensor] = None,
+) -> Optional[list[dict]]:
+    """
+    Legacy synchronous batch processing (for backwards compatibility).
+    """
+    gpu_result, metrics = gpu_process_batch(
+        model, batch, indexes, config, exclude_tokens, think_token_ids
+    )
+    if gpu_result is None:
+        return None
+    return cpu_postprocess_batch(gpu_result, config)
 
 
 # =============================================================================
@@ -1154,41 +1262,79 @@ def run_extraction(config: ExtractionConfig, verify_mask: bool = False):
         num_workers=0,  # Use 0 to avoid issues with multiprocessing
     )
 
-    # Process loop
+    # Process loop with async CPU post-processing
     print(f"\n🚀 Starting extraction ({len(loader)} batches)...")
-    pbar = tqdm(loader, desc="Extracting logits")
+    print("   GPU/CPU pipelining enabled for maximum throughput")
 
-    for batch_idx, (batch, indexes) in enumerate(loader):
-        interrupt_handler.check_and_exit()
+    async_processor = AsyncPostProcessor(max_workers=2)
+    pbar = tqdm(total=len(df), desc="Extracting logits")
 
-        results = process_batch(
-            model,
-            tokenizer,
-            batch,
-            indexes,
-            config,
-            exclude_tokens=exclude_tokens,
-            think_token_ids=think_tokens_tensor,
-        )
+    # Track moving average of metrics for display
+    avg_model_ms = 0.0
+    avg_postprocess_ms = 0.0
+    avg_tok_per_sec = 0.0
+    ema_alpha = 0.1  # Exponential moving average smoothing
 
-        if results:
+    try:
+        for batch_idx, (batch, indexes) in enumerate(loader):
+            interrupt_handler.check_and_exit()
+
+            # GPU processing for current batch
+            gpu_result, gpu_metrics = gpu_process_batch(
+                model,
+                batch,
+                indexes,
+                config,
+                exclude_tokens=exclude_tokens,
+                think_token_ids=think_tokens_tensor,
+            )
+
+            if gpu_result is not None:
+                # Submit for async CPU post-processing (returns previous batch results)
+                prev_result = async_processor.submit(gpu_result, config, gpu_metrics)
+
+                # Process previous batch results if available
+                if prev_result is not None:
+                    results, metrics = prev_result
+                    for sample in results:
+                        uploader.add_sample(sample)
+
+                    if uploader.should_flush():
+                        uploader.flush()
+
+                    # Update moving averages
+                    avg_model_ms = ema_alpha * metrics.model_time_ms + (1 - ema_alpha) * avg_model_ms
+                    avg_postprocess_ms = ema_alpha * metrics.postprocess_time_ms + (1 - ema_alpha) * avg_postprocess_ms
+                    avg_tok_per_sec = ema_alpha * metrics.model_tokens_per_sec + (1 - ema_alpha) * avg_tok_per_sec
+
+            # Update progress bar
+            batch_size = batch["input_ids"].size(0)
+            pbar.update(batch_size)
+            pbar.set_postfix(
+                {
+                    "gpu": f"{avg_model_ms:.0f}ms",
+                    "cpu": f"{avg_postprocess_ms:.0f}ms",
+                    "tok/s": f"{avg_tok_per_sec:.0f}",
+                    "buf": len(uploader.buffer),
+                    "up": uploader.total_samples_uploaded,
+                },
+                refresh=True
+            )
+
+            # Periodic cleanup
+            if (batch_idx + 1) % 1000 == 0:
+                torch.cuda.empty_cache()
+
+        # Flush remaining async work
+        final_result = async_processor.flush()
+        if final_result is not None:
+            results, _ = final_result
             for sample in results:
                 uploader.add_sample(sample)
 
-            if uploader.should_flush():
-                uploader.flush()
-
-        pbar.update(batch["input_ids"].size(0))
-        pbar.set_postfix(
-            {
-                "buffer": len(uploader.buffer),
-                "uploaded": uploader.total_samples_uploaded,
-            }
-        )
-
-        # Periodic cleanup
-        if (batch_idx + 1) % 1000 == 0:
-            torch.cuda.empty_cache()
+    finally:
+        async_processor.shutdown()
+        pbar.close()
 
     # Final flush
     uploader.flush(final=True)
