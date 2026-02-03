@@ -1,112 +1,262 @@
-# Logit Extraction and Alignment Analysis
+# Logit Extraction for Knowledge Distillation
 
-This repository contains tools for extracting token probabilities (logits) from Large Language Models and analyzing them aligned with the original conservation text.
+This repository provides tools for extracting token-level logits (probabilities) from Large Language Models in a highly compressed format, designed for efficient knowledge distillation.
 
 ## Overview
 
-The core functionality consists of two main parts:
-1.  **Extraction (`extract_logits.py`)**: Efficiently runs a model on a dataset, extracts the top-K and sampled logits for assistant responses, and saves them in a highly compressed format.
-2.  **Analysis (`explore_logits.py`)**: Loads the compressed logit data, reconstructs the original conversation, aligned tokens, and visualizes the model's confidence.
+The pipeline consists of three main components:
 
-**Supported Use Cases:**
-*   **Models**: Instruction fine-tuned models (e.g., Chat/Instruct versions). Base models that do not support chat templates are not supported.
-*   **Datasets**: Single-turn chat datasets (User query -> Assistant response). Multi-turn conversations are not currently supported.
+| Script | Purpose |
+|--------|---------|
+| `compute_lengths.py` | Pre-compute token lengths for efficient batch ordering |
+| `extract_logits.py` | Extract and compress logits from model inference |
+| `explore_logits.py` | Load, decompress, and analyze extracted logits |
 
-## Data Structure
+### Why Compressed Logits?
 
-The extracted data is saved in a compressed format to minimize storage size while retaining precision where it matters.
+Full logit extraction stores the entire vocabulary distribution per token (~150K floats × 4 bytes = 600KB per token). This repository instead extracts:
 
-### Storage Format
-The data is stored in a Hugging Face dataset with the following schema:
+1. **Nucleus (Top-P) Logits**: The minimum set of tokens whose cumulative probability exceeds a threshold (e.g., 98%), up to a maximum count (e.g., 100 tokens)
+2. **Sampled Logits**: Additional randomly sampled tokens from the remaining vocabulary (e.g., 24 tokens)
 
-*   **`top_logits_quantized`** (`bytes`): Top-K log probabilities quantized to `uint8`.
-*   **`top_indices_low`** (`list[uint16]`): Lower 16 bits of the Token IDs for the top-K logits.
-*   **`top_indices_high`** (`bytes`): Upper bits of the Token IDs, packed into 2-bit chunks (4 indices per byte).
-*   **`sampled_logits_quantized`** (`bytes`): Log probabilities for the sampled nucleus, quantized to `uint8`.
-*   **`sampled_indices_low`** / **`sampled_indices_high`**: Same packed format for the sampled indices.
-*   **`logsumexp`** (`float`): The LogSumExp of the logits, used to reconstruct exact probabilities.
-*   **`num_tokens`** (`int`): Total number of extracted tokens in the sample.
+This reduces storage by ~1000x while preserving the information needed for distillation.
 
-### Index Unpacking
-Token IDs are split to save space, as most tokens fit in 16 bits, but vocabularies > 65536 require more. The unpacking logic is:
+## Supported Use Cases
+
+- **Models**: Instruction-tuned models with chat templates (e.g., Qwen-Instruct, Llama-Chat). Base models without chat templates are not supported.
+- **Datasets**: Single-turn conversations (User → Assistant). Multi-turn is not currently supported.
+
+---
+
+## Quick Start
+
+### 1. Pre-compute Token Lengths (Optional but Recommended)
+
+Pre-computing lengths enables **length-based batch ordering**, which dramatically improves GPU utilization. The extraction script sorts examples by length (longest first) and dynamically increases batch size as sequence length decreases. This prevents wasted padding and maximizes throughput.
+
+```bash
+python compute_lengths.py \
+    --model Qwen/Qwen3-4B-Instruct-2507 \
+    --dataset MegaScience/MegaScience \
+    --output-repo your-username/MegaScience-Lengths-Qwen3 \
+    --chat-template ./qwen_chat_template.jinja \
+    --user-col question \
+    --assistant-col answer \
+    --num-proc 16 \
+    --push-to-hub
+```
+
+**Key Arguments:**
+| Argument | Description |
+|----------|-------------|
+| `--model` | HuggingFace model ID (tokenizer must match the extraction model) |
+| `--dataset` | Source dataset to compute lengths for |
+| `--output-repo` | HuggingFace repo to upload the lengths dataset |
+| `--chat-template` | Path to custom Jinja2 chat template (required if model template lacks `assistant_mask`) |
+| `--num-proc` | Number of parallel workers for tokenization |
+| `--push-to-hub` | Upload result to HuggingFace Hub |
+
+### 2. Extract Logits
+
+This is the main extraction script. Here's a complete example with explanations:
+
+```bash
+python extract_logits.py \
+    --model Qwen/Qwen3-4B-Instruct-2507 \
+    --dataset MegaScience/MegaScience \
+    --output seba/MegaScience-Q3-4B-I-2507-Logits \
+    --max-seq-len 4096 \
+    --upload-every 15000 \
+    --subject-col subject \
+    --tokenized-dataset seba/MegaScience-Lengths-Qwen3 \
+    --chat-template ./qwen_chat_template.jinja \
+    --sample-subject '{"*": 50000}' \
+    --length-col length \
+    --resume \
+    --random-sample
+```
+
+**Argument Breakdown:**
+
+| Argument | Value | Explanation |
+|----------|-------|-------------|
+| `--model` | `Qwen/Qwen3-4B-Instruct-2507` | The model to extract logits from |
+| `--dataset` | `MegaScience/MegaScience` | Source dataset with conversations |
+| `--output` | `seba/MegaScience-Q3-4B-I-2507-Logits` | HuggingFace repo for extracted logits |
+| `--max-seq-len` | `4096` | Skip examples longer than this (prevents OOM) |
+| `--upload-every` | `15000` | Upload a parquet chunk every N samples |
+| `--subject-col` | `subject` | Column for stratified sampling (optional) |
+| `--tokenized-dataset` | `seba/MegaScience-Lengths-Qwen3` | Pre-computed lengths dataset (from step 1) |
+| `--chat-template` | `./qwen_chat_template.jinja` | Custom chat template with `{% generation %}` markers |
+| `--sample-subject` | `'{"*": 50000}'` | Sample up to 50k examples per subject (`*` = default) |
+| `--length-col` | `length` | Column name containing token lengths |
+| `--resume` | flag | Resume from previous checkpoint if interrupted |
+| `--random-sample` | flag | Randomly sample instead of taking first N |
+
+**Additional Useful Arguments:**
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--top-p` | `0.98` | Nucleus sampling threshold (cumulative probability) |
+| `--top-p-max` | `100` | Maximum tokens in nucleus |
+| `--sampled-n` | `24` | Additional tokens sampled from remaining vocab |
+| `--batch-thresholds` | auto | JSON dict mapping seq_len → batch_size |
+| `--limit` | None | Limit total samples to process |
+| `--full-dataset` | flag | Process entire dataset (no sampling) |
+
+### 3. Analyze Extracted Logits
+
+Use `explore_logits.py` or the Jupyter notebook to verify extractions and analyze model confidence:
+
+```python
+from explore_logits import execute_analysis
+
+# Run full alignment analysis for a sample
+analysis = execute_analysis(
+    logit_dataset_id="seba/MegaScience-Q3-4B-I-2507-Logits",
+    sample_index=0,
+    chat_template="./qwen_chat_template.jinja"  # Same template used for extraction
+)
+```
+
+Or explore interactively:
+
+```python
+from explore_logits import (
+    load_logit_dataset,
+    get_sample,
+    print_sample_info,
+    dequantize_top_logits,
+    plot_nucleus_sizes
+)
+
+# Load and inspect
+ds = load_logit_dataset("seba/MegaScience-Q3-4B-I-2507-Logits")
+sample = get_sample(ds, index=0)
+print_sample_info(sample)
+
+# Visualize nucleus size distribution
+plot_nucleus_sizes(sample)
+
+# Get logits for a specific token position
+indices, logits = dequantize_top_logits(sample, token_idx=0)
+```
+
+---
+
+## Data Format
+
+The extracted data is stored as Parquet files with the following schema:
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `index` | int32 | Original dataset index |
+| `num_tokens` | int32 | Number of extracted tokens |
+| `top_indices_low` | list[uint16] | Lower 16 bits of nucleus token IDs |
+| `top_indices_high` | binary | Upper 2 bits packed (4 per byte) |
+| `top_logits_quantized` | list[uint16] | Quantized nucleus logits |
+| `top_counts` | list[uint8] | Number of nucleus tokens per position |
+| `top_min` / `top_max` | list[float32] | Quantization range per position |
+| `sampled_indices_*` | same as top | Sampled token data (same format) |
+| `logsumexp` | list[float32] | LogSumExp for probability reconstruction |
+
+### Index Packing
+
+Token IDs are split to save space (most tokens fit in 16 bits, but vocabularies >65536 need more):
 
 ```python
 full_index = low_bits | (high_bits << 16)
 ```
 
-The `high_bits` are extracted from the packed bytes where each byte holds 4 high-bit entries:
+The `high_bits` are packed 4 per byte:
 - Bits 0-1: Index 0
 - Bits 2-3: Index 1
 - Bits 4-5: Index 2
 - Bits 6-7: Index 3
 
-## Prerequisites: Chat Templates & Assistant Masks
+### Logit Dequantization
 
-⚠️ **CRITICAL**: This tool relies on the tokenizer's chat template producing an `assistant_mask` to identify which tokens belong to the model's output.
-Many default chat templates (e.g., standard Llama 2/3 templates from Hugging Face) **DO NOT** produce this mask by default.
-
-If your model's default template does not support `assistant_masks` (or if you get 0 logit tokens extracted), you **MUST** provide a custom chat template that defines the generation structure.
-
-## Usage
-
-### 1. Extraction
-
-Run `extract_logits.py` to process a dataset. Only data falling under the assistant mask will be extracted.
-
-```bash
-python extract_logits.py \
-    --model_id "Qwen/Qwen2.5-0.5B-Instruct" \
-    --dataset_id "MegaScience/MegaScience" \
-    --output_repo "user/my-logits-dataset" \
-    --chat_template "path/to/custom_template.jinja" 
-```
-
-**Note:** You can pass a path to a jinja file or the template string itself to `--chat_template`.
-
-### 2. Analysis & Visualization
-
-Use `explore_logits.py` or the provided notebook to verify and explore the data. If the extraction used a custom template, you should likely use the same one here for correct alignment.
+Logits are quantized to uint16 for storage. To reconstruct:
 
 ```python
-from explore_logits import execute_analysis
-
-# You can pass the template as a string or file path
-my_template = "{% for message in messages %}...{% endfor %}"
-
-execute_analysis(
-    logit_dataset_id="user/my-logits-dataset",
-    sample_index=0,
-    chat_template=my_template
-)
+logit = (quantized / 65535) * (max - min) + min
+probability = exp(logit - logsumexp)
 ```
 
-**Alignment Logic:**
-The analysis script (`analyze_token_probabilities`) performs the following steps to align extracted logits with the text:
-1.  **Reconstruction**: Re-applies the chat template (provided or default) to the original dataset sample to regenerate the exact input tokens seen by the model.
-2.  **Masking**: Replicates the filtering logic used during extraction (excluding think tags, end tokens, etc.) to identify exactly which tokens were skipped.
-3.  **Matching**: Maps the remaining "valid" tokens to the extracted logit sequence 1:1.
-4.  **Prediction**: For each real token, it retrieves the top predicted tokens from the logits to compare what the model *wanted* to say vs what was actually said.
+---
 
-### 3. Decompression
+## Chat Templates & Assistant Masks
 
-The `explore_logits.py` script provides helper functions to handle the data:
+**CRITICAL**: The extraction relies on the tokenizer's chat template producing an `assistant_mask` to identify which tokens belong to the model's response. Many default templates **DO NOT** produce this mask.
 
-- `unpack_indices(low, high)`: Reconstructs full 32-bit token IDs.
-- `dequantize_all_logits(sample, index)`: Retrieves the full probability distribution (Nucleus + Sampled) for a specific token position.
+If you get 0 tokens extracted, you need a custom template with `{% generation %}` markers:
 
-## Visualization Output
-
-The analysis tool produces a detailed line-by-line view:
-
-```text
-Detailed Token Analysis:
-================================================================================
-Real Token                     | Extracted Predictions (Top 5)
---------------------------------------------------------------------------------
-"The"                          | "The"(0.85), "A"(0.10), ...
-"extraction"                   | "extraction"(0.99), ...
+```jinja
+{%- for message in messages %}
+{%- if message['role'] == 'user' %}
+<|im_start|>user
+{{ message['content'] }}<|im_end|>
+{%- elif message['role'] == 'assistant' %}
+<|im_start|>assistant
+{% generation %}{{ message['content'] }}{% endgeneration %}<|im_end|>
+{%- endif %}
+{%- endfor %}
 ```
 
-- **Real Token**: The actual token from the dataset.
-- **Predictions**: The model's top predicted next tokens with their probabilities.
-- **Skipped**: Tokens marked as skipped (e.g., `<think>`) will be greyed out.
+The `{% generation %}` / `{% endgeneration %}` markers define the assistant response region.
+
+---
+
+## Analysis Visualization
+
+Shows the prediction probabilities for the next token.
+
+![](assets/img1.png)
+
+## Efficient Batching with Pre-computed Lengths
+
+When you provide pre-computed token lengths via `--tokenized-dataset` and `--length-col`:
+
+1. **Sorting**: Examples are sorted by length in **descending order** (longest first)
+2. **Dynamic Batching**: Batch size increases as sequence length decreases based on thresholds:
+   ```
+   Length ≤ 256  → batch size 16
+   Length ≤ 512  → batch size 8
+   Length ≤ 1024 → batch size 4
+   Length ≤ 2048 → batch size 2
+   Length > 2048 → batch size 1
+   ```
+3. **Benefits**:
+   - Minimizes padding waste (similar-length sequences grouped together)
+   - Maximizes GPU utilization (larger batches for shorter sequences)
+   - Prevents OOM (long sequences processed individually)
+
+Without pre-computed lengths, the script processes examples in dataset order with conservative batch sizes.
+
+---
+
+## Resume Support
+
+The extraction supports graceful interruption and resume:
+
+- Press `Ctrl+C` once to trigger graceful shutdown (flushes current buffer)
+- Use `--resume` to continue from the last checkpoint
+- Checkpoints are stored locally (`.logit_extraction_cache/`) and on HuggingFace
+
+---
+
+## Requirements
+
+```
+torch
+transformers
+datasets
+huggingface_hub
+pandas
+pyarrow
+numpy
+tqdm
+matplotlib  # for visualization
+seaborn     # for visualization
+termcolor   # for colored console output
+```
