@@ -25,11 +25,17 @@ Usage in Jupyter notebook:
 
 import numpy as np
 import pandas as pd
-from datasets import load_dataset
+import torch
+from datasets import load_dataset, IterableDataset
 from typing import Optional, Union, List, Dict, Any
 import matplotlib.pyplot as plt
 import seaborn as sns
 from collections import defaultdict
+import json
+import os
+from huggingface_hub import hf_hub_download
+from termcolor import colored
+import html
 
 # Constants
 UINT16_MAX = 65535
@@ -133,7 +139,7 @@ def unpack_indices(low_bits_list, high_bits_list, sizes_list=None):
 # =============================================================================
 
 
-def load_logit_dataset(dataset_id: str, split: str = "train", streaming: bool = False):
+def load_logit_dataset(dataset_id: str, split: str = "train", streaming: bool = True):
     """
     Load a logit extraction dataset from HuggingFace Hub.
 
@@ -170,10 +176,31 @@ def get_sample(dataset, index: int = 0) -> Dict[str, Any]:
     Example:
         sample = get_sample(ds, index=42)
     """
-    if hasattr(dataset, "__getitem__"):
+    # Check if it's an IterableDataset (streaming)
+    # IterableDataset has __getitem__ but it returns a column, not a row by index!
+    if isinstance(dataset, IterableDataset):
+        item = None
+        # Try efficient skip/take if available
+        if hasattr(dataset, "skip") and hasattr(dataset, "take"):
+            try:
+                # take(1) returns an iterable, we need the first item
+                item = list(dataset.skip(index).take(1))[0]
+            except Exception:
+                pass  # Fallback to loop
+
+        if item is None:
+            # Fallback to iteration
+            for i, curr in enumerate(dataset):
+                if i == index:
+                    item = curr
+                    break
+            if item is None:
+                raise IndexError(f"Index {index} out of range")
+    elif hasattr(dataset, "__getitem__"):
+        # Map-style dataset (random access)
         item = dataset[index]
     else:
-        # Streaming dataset - iterate to index
+        # Fallback for generic iterables
         item = None
         for i, curr in enumerate(dataset):
             if i == index:
@@ -791,6 +818,457 @@ def print_top_tokens(
 # =============================================================================
 
 
+# =============================================================================
+# Advanced Analysis & Alignment
+# =============================================================================
+
+
+def load_extraction_config(repo_id: str) -> Dict[str, Any]:
+    """
+    Load the extraction configuration from the HuggingFace dataset repository.
+
+    Args:
+        repo_id: The ID of the logit dataset (e.g. "user/dataset-logits")
+
+    Returns:
+        Configuration dictionary
+    """
+    try:
+        config_path = hf_hub_download(
+            repo_id=repo_id, filename="checkpoint.json", repo_type="dataset"
+        )
+        with open(config_path, "r") as f:
+            data = json.load(f)
+            return data.get("config", {})
+    except Exception as e:
+        print(f"⚠️ Could not load config from {repo_id}: {e}")
+        return {}
+
+
+def analyze_token_probabilities(
+    logit_sample: Dict[str, Any],
+    original_text_sample: Dict[str, Any],
+    tokenizer,
+    chat_template: Optional[str] = None,
+    config: Optional[Dict[str, Any]] = None,
+    top_k_predictions: int = 5,
+) -> List[Dict[str, Any]]:
+    """
+    Align extracted logits with the original text to analyze the probability of actual tokens.
+
+    Args:
+        logit_sample: Sample from the logit dataset
+        original_text_sample: Corresponding sample from the original text dataset
+        tokenizer: Tokenizer used for the model
+        chat_template: Optional chat template override
+        config: Extraction configuration (for exclusion settings)
+
+    Returns:
+        List of dicts containing analysis for each token
+    """
+    config = config or {}
+
+    # 1. Reconstruct inputs to match what the model saw
+    # We need to reconstruct the message format expected by the chat template
+    # Depending on the dataset, we might need to map columns
+    if "messages" in original_text_sample:
+        messages = original_text_sample["messages"]
+    elif "conversation" in original_text_sample:
+        messages = original_text_sample["conversation"]
+    elif "conversations" in original_text_sample:
+        messages = original_text_sample["conversations"]
+    else:
+        # Fallback for simple user/assistant columns if known
+        # This is a bit heuristical, might need config to know column names
+        user_content = original_text_sample.get(
+            "question", original_text_sample.get("input", "")
+        )
+        assistant_content = original_text_sample.get(
+            "answer", original_text_sample.get("output", "")
+        )
+        messages = [
+            {"role": "user", "content": user_content},
+            {"role": "assistant", "content": assistant_content},
+        ]
+
+    # 2. Tokenize and get assistant mask
+    tokenized = tokenizer.apply_chat_template(
+        messages,
+        return_dict=True,
+        return_tensors="pt",
+        return_assistant_tokens_mask=True,
+        chat_template=chat_template,
+    )
+
+    input_ids = tokenized["input_ids"][0]
+    assistant_mask = tokenized["assistant_masks"][0].bool()
+
+    # --- Replicate Extraction Filtering Logic ---
+
+    # Define special tokens to exclude
+    # This tries to mimic the logic in extract_logits.py
+
+    # Exclude end tokens?
+    if config.get(
+        "exclude_end_tokens", False
+    ):  # Default to True if not in config, safer
+        # Try to find end tokens
+        exclude_tokens = []
+        if tokenizer.pad_token_id is not None:
+            exclude_tokens.append(tokenizer.pad_token_id)
+        if tokenizer.eos_token_id is not None:
+            exclude_tokens.append(tokenizer.eos_token_id)
+
+        # Add common special tokens if present in vocab
+        for special in ["<|im_end|>", "<|endoftext|>"]:
+            if special in tokenizer.get_vocab():
+                exclude_tokens.append(tokenizer.get_vocab()[special])
+
+        if exclude_tokens:
+            exclude_tensor = torch.tensor(exclude_tokens)
+            # Logic: If previous token was special, mask current token?
+            # Original script: is_not_after_special = ~torch.isin(batch["input_ids"].roll(1), exclude_tokens)
+            # This implies we exclude tokens that FOLLOW a special token (like partial end sequences?)
+            # Or maybe it's excluding the special tokens themselves?
+            # Wait, `batch["input_ids"].roll(1)` shifts right. So it checks the previous token.
+            # If index i has special token at i-1, then roll(1)[i] is special.
+            # So it masks i.
+
+            is_not_after_special = ~torch.isin(
+                input_ids.roll(1), exclude_tensor.to(input_ids.device)
+            )
+            # Also mask the special tokens themselves if they are assistant tokens?
+            # The original script doesn't explicitly mask the special tokens here,
+            # assuming assistant_mask handles it (or they are not part of assistant response)
+            # But usually <|im_end|> IS part of assistant response in some templates.
+
+            assistant_mask = assistant_mask & is_not_after_special
+
+    # Exclude think tags?
+    if config.get("exclude_think_tags", False):
+        # Identify think tokens
+        think_token_ids = []
+        for tag in [
+            "<|thought|>",
+            "<|im_start|>thought",
+            "<think>",
+        ]:  # Common variations
+            if tag in tokenizer.get_vocab():
+                think_token_ids.append(tokenizer.get_vocab()[tag])
+
+        if think_token_ids:
+            think_tensor = torch.tensor(think_token_ids)
+            is_not_think = torch.ones_like(input_ids, dtype=torch.bool)
+
+            for think_id in think_token_ids:
+                think_id_tensor = torch.tensor([think_id]).to(input_ids.device)
+
+                # Exclude the token itself
+                is_not_think &= ~torch.isin(input_ids, think_id_tensor)
+
+                # Exclude a few tokens after (replicating original script loop 1..4)
+                for shift in range(1, 4):
+                    is_not_think &= ~torch.isin(input_ids.roll(shift), think_id_tensor)
+
+            assistant_mask = assistant_mask & is_not_think
+
+    # 3. Extract assistant tokens (filtered)
+    # We want to keep track of ALL assistant tokens, but know which ones were skipped
+    # So we get indices of assistant tokens
+
+    # Original assistant mask (raw from template)
+    raw_assistant_mask = tokenized["assistant_masks"][0].bool()
+    raw_assistant_indices = raw_assistant_mask.nonzero(as_tuple=True)[0]
+
+    # Filtered assistant mask (what was extracted)
+    filtered_assistant_indices = assistant_mask.nonzero(as_tuple=True)[0]
+    filtered_indices_set = set(filtered_assistant_indices.tolist())
+
+    # Verify alignment
+    num_logit_tokens = logit_sample["num_tokens"]
+    num_filtered_tokens = len(filtered_assistant_indices)
+
+    if num_logit_tokens != num_filtered_tokens:
+        print(
+            f"⚠️ Warning: Token count mismatch! Logits: {num_logit_tokens}, Text (Filtered): {num_filtered_tokens}"
+        )
+        # Try to fallback: if simple alignment works better?
+        # Or just allow mismatch and align as much as possible from end?
+
+    # 4. Analyze each token
+    analysis = []
+
+    # Iterator for logit index
+    logit_idx_counter = 0
+
+    # Iterate over ALL assistant tokens (raw)
+    for idx in raw_assistant_indices:
+        idx = idx.item()
+        token_id = input_ids[idx].item()
+        token_str = tokenizer.decode([token_id])
+
+        is_skipped = idx not in filtered_indices_set
+
+        # If we have extracted logits for this token
+        if not is_skipped and logit_idx_counter < num_logit_tokens:
+            logits_info = dequantize_all_logits(logit_sample, logit_idx_counter)
+            logit_idx_counter += 1
+
+            nucleus_indices = logits_info["nucleus_indices"]
+            nucleus_logits = logits_info["nucleus_logits"]
+            sampled_indices = logits_info["sampled_indices"]
+            sampled_logits = logits_info["sampled_logits"]
+            lse = logits_info["logsumexp"]
+
+            # Calculate probabilities
+            nucleus_probs = logits_to_probs(nucleus_logits, lse)
+            sampled_probs = logits_to_probs(sampled_logits, lse)
+
+            # Find where the actual token is
+            in_nucleus = token_id in nucleus_indices
+            in_sampled = token_id in sampled_indices
+
+            prob = 0.0
+            rank = -1
+
+            if in_nucleus:
+                loc = np.where(nucleus_indices == token_id)[0][0]
+                prob = nucleus_probs[loc]
+                rank = loc
+            elif in_sampled:
+                loc = np.where(sampled_indices == token_id)[0][0]
+                prob = sampled_probs[loc]
+                rank = len(nucleus_indices) + loc
+            else:
+                prob = 0.0
+                rank = ">" + str(len(nucleus_indices) + len(sampled_indices))
+
+            # --- Extract Top K Predictions ---
+            # Combine nucleus and sampled to find top tokens
+            # Nucleus is sorted by prob, sampled might not be strictly sorted globally but usually is
+
+            # Create a unified list of (token_id, prob)
+            all_candidates = []
+            for tid, p in zip(nucleus_indices, nucleus_probs):
+                all_candidates.append((tid, p))
+            for tid, p in zip(sampled_indices, sampled_probs):
+                all_candidates.append((tid, p))
+
+            # Sort by probability descending
+            all_candidates.sort(key=lambda x: x[1], reverse=True)
+
+            # Take top K
+            top_predictions = []
+            for tid, p in all_candidates[:top_k_predictions]:
+                t_str = tokenizer.decode([tid])
+                top_predictions.append(
+                    {"token_id": int(tid), "token": t_str, "prob": float(p)}
+                )
+
+            analysis.append(
+                {
+                    "token_id": token_id,
+                    "token": token_str,
+                    "prob": float(prob),
+                    "rank": rank,
+                    "in_nucleus": bool(in_nucleus),
+                    "in_sampled": bool(in_sampled),
+                    "skipped": False,
+                    "top_predictions": top_predictions,
+                }
+            )
+        else:
+            # Skipped or ran out of logits
+            analysis.append(
+                {
+                    "token_id": token_id,
+                    "token": token_str,
+                    "prob": 0.0,
+                    "rank": -1,
+                    "in_nucleus": False,
+                    "in_sampled": False,
+                    "skipped": True,
+                }
+            )
+
+    return analysis
+
+
+def visualize_conversation_probabilities(
+    analysis: List[Dict[str, Any]], return_html: bool = False, detailed: bool = True
+):
+    """
+    Visualize the conversation with tokens colored by probability.
+
+    Args:
+        analysis: Result from analyze_token_probabilities
+        return_html: If True, return HTML string instead of printing
+        detailed: If True, print detailed line-by-line info (Console only)
+
+    Returns:
+        None or HTML string
+    """
+
+    def get_color(prob, skipped=False):
+        if skipped:
+            return "white"
+        # Green (high) -> Yellow (med) -> Red (low)
+        if prob > 0.9:
+            return "green"
+        if prob > 0.5:
+            return "cyan"
+        if prob > 0.1:
+            return "yellow"
+        if prob > 0.01:
+            return "red"
+        return "magenta"  # Very low
+
+    def get_html_color(prob, skipped=False):
+        if skipped:
+            return "#888888"
+        if prob > 0.9:
+            return "#4CAF50"  # Green
+        if prob > 0.5:
+            return "#CDDC39"  # Lime
+        if prob > 0.1:
+            return "#FFC107"  # Amber
+        if prob > 0.01:
+            return "#FF5722"  # Deep Orange
+        return "#795548"  # Brown (very low)
+
+    # HTML output (for Jupyter) - primarily for quick visual
+    if return_html:
+        html_parts = [
+            '<div style="font-family: monospace; line-height: 1.5; background: #1e1e1e; color: #d4d4d4; padding: 20px; border-radius: 8px;">'
+        ]
+
+        for item in analysis:
+            token = item["token"]
+            # Escape HTML special chars
+            token = html.escape(token)
+            # Visualize newlines
+            token = token.replace("\n", "<br/>")
+
+            prob = item["prob"]
+            rank = item["rank"]
+            skipped = item.get("skipped", False)
+            color = get_html_color(prob, skipped)
+
+            tooltip = f"Token: {html.escape(repr(item['token']))} | Prob: {prob:.4f} | Rank: {rank}"
+            if skipped:
+                tooltip = "Skipped (Think tag or End token)"
+                style = f"color: {color}; text-decoration: line-through; border-bottom: 1px dotted #555;"
+            else:
+                style = f"color: {color}; border-bottom: 1px dotted #555;"
+
+            span = f'<span style="{style}" title="{tooltip}">{token}</span>'
+            html_parts.append(span)
+
+        html_parts.append("</div>")
+
+        # Add legend
+        html_parts.append("""
+        <div style="margin-top: 10px; font-size: 0.8em; color: #888;">
+            Legend: 
+            <span style="color: #4CAF50"> >90% </span> |
+            <span style="color: #CDDC39"> >50% </span> |
+            <span style="color: #FFC107"> >10% </span> |
+            <span style="color: #FF5722"> >1% </span> |
+            <span style="color: #795548"> <1% </span> |
+            <span style="color: #888888; text-decoration: line-through;"> Skipped </span>
+        </div>
+        """)
+
+        return "".join(html_parts)
+
+    # Console output
+    if not detailed:
+        print("\nToken Probabilities:")
+        print("-" * 60)
+        line_buffer = ""
+        for item in analysis:
+            token = item["token"]
+            prob = item["prob"]
+            skipped = item.get("skipped", False)
+            color = get_color(prob, skipped)
+
+            if "\n" in token:
+                print(line_buffer)
+                print(colored("↵", "grey"))  # Visual newline
+                line_buffer = ""
+                token = token.replace("\n", "")
+
+            token_display = repr(token)[1:-1]
+            if not token_display:
+                continue
+
+            try:
+                if skipped:
+                    print(colored(token_display, color, attrs=["strike"]), end=" ")
+                else:
+                    print(colored(token_display, color), end=" ")
+            except:
+                print(token_display, end=" ")
+        print("\n" + "-" * 60)
+    else:
+        # DETAILED LINE-BY-LINE OUTPUT
+        print("\nDetailed Token Analysis:")
+        print("=" * 120)
+        print(f"{'Real Token':<30} | {'Extracted Predictions (Top 5)':<80}")
+        print("-" * 120)
+
+        for item in analysis:
+            token = item["token"]
+            skipped = item.get("skipped", False)
+            top_predictions = item.get("top_predictions", [])
+
+            # Format real token
+            token_display = repr(token)
+            if len(token_display) > 28:
+                token_display = token_display[:25] + "..."
+
+            if skipped:
+                token_colored = colored(token_display, "white", attrs=["dark"])
+                predictions_str = colored("(Skipped - Filtered)", "grey")
+            else:
+                prob = item["prob"]
+                rank = item["rank"]
+                color = get_color(prob)
+                token_colored = colored(token_display, color)
+
+                # Format predictions
+                preds_parts = []
+                for pred in top_predictions:
+                    p_token = pred["token"]
+                    p_prob = pred["prob"]
+                    p_color = get_color(p_prob)
+
+                    p_display = repr(p_token)
+                    if len(p_display) > 15:
+                        p_display = p_display[:12] + "..."
+
+                    # Highlight if it matches real token
+                    # Note: We compare token IDs ideally, but here we just have strings and IDs in dict
+                    # The real token ID is item["token_id"]
+                    is_match = pred["token_id"] == item["token_id"]
+
+                    pred_str = f"{p_display}({p_prob:.2f})"
+                    if is_match:
+                        pred_str = colored(
+                            pred_str, p_color, attrs=["bold", "underline"]
+                        )
+                    else:
+                        pred_str = colored(pred_str, p_color)
+
+                    preds_parts.append(pred_str)
+
+                predictions_str = ", ".join(preds_parts)
+
+            print(f"{token_colored:<30} | {predictions_str}")
+
+        print("=" * 120)
+
+
 def quick_explore(
     dataset_id: str,
     sample_idx: int = 0,
@@ -826,6 +1304,117 @@ def quick_explore(
     if model_id:
         from transformers import AutoTokenizer
 
-        print(f"\n🤖 Loading tokenizer: {model_id}")
+        print(f"\\n🤖 Loading tokenizer: {model_id}")
         tokenizer = AutoTokenizer.from_pretrained(model_id)
         print_top_tokens(sample, token_idx, tokenizer, top_k=20)
+
+
+def execute_analysis(
+    logit_dataset_id: str,
+    sample_index: int = 0,
+    tokenizer_id: Optional[str] = None,
+    original_dataset_id: Optional[str] = None,
+    chat_template: Optional[str] = None,
+):
+    """
+    Execute full analysis for a sample, aligning logits with original text.
+
+    Args:
+        logit_dataset_id: ID of the logit dataset
+        sample_index: Index of the sample to analyze
+        tokenizer_id: ID of the tokenizer (optional, will try to load from config)
+        original_dataset_id: ID of original dataset (optional, will try to load from config)
+    """
+    # 1. Load config to find original dataset and model
+    print(f"🔧 Loading config from {logit_dataset_id}...")
+    config = load_extraction_config(logit_dataset_id)
+
+    # 2. Determine Original Dataset and Model
+    orig_ds_id = original_dataset_id or config.get("dataset_id")
+    if not orig_ds_id:
+        raise ValueError(
+            "Could not determine original dataset ID from config. Please provide `original_dataset_id`."
+        )
+
+    model_id = tokenizer_id or config.get("model_id")
+    if not model_id:
+        raise ValueError(
+            "Could not determine model ID from config. Please provide `tokenizer_id`."
+        )
+
+    print(f"📊 Original Dataset: {orig_ds_id}")
+    print(f"🤖 Model/Tokenizer: {model_id}")
+
+    # 3. Load Resources
+    # Load logit dataset (streaming)
+    ds_logits = load_logit_dataset(logit_dataset_id, streaming=True)
+    logit_sample = get_sample(ds_logits, sample_index)
+
+    # Load original dataset (streaming)
+    print(f"📦 Loading original dataset: {orig_ds_id}")
+    ds_orig = load_dataset(orig_ds_id, split="train", streaming=True)
+
+    # Get the original sample (need to match index)
+    # Note: If logit dataset has 'index' column matching original dataset, use that.
+    # Otherwise assume 1:1 mapping if not shuffled.
+    original_idx = logit_sample.get("index", sample_index)
+    print(
+        f"📍 Fetching sample index: {original_idx} (Logit Sample Index: {sample_index})"
+    )
+
+    # In streaming mode, we iterate to find the index
+    # Optimization: if original_idx is large, this might be slow, but safe for streaming
+    original_sample = None
+    # We might need to iterate quite a bit if indices are sparse or shuffled
+    # Ideally logic_sample['index'] should correspond to the i-th element of original dataset if not skipped
+    # But often it refers to the index column in original dataset.
+    # Let's assume for now we can select by index or iterate.
+    # Since streaming datasets don't support .iloc, we proceed by iteration
+
+    # Iterate and find matching index
+    # Only iterate up to a reasonable limit or if indices match
+    # For now, simplistic approach: iterate until we hit the count
+    current_idx = 0
+    for item in ds_orig:
+        if current_idx == original_idx:  # This assumes dataset order is preserved 1:1
+            original_sample = item
+            break
+        current_idx += 1
+        # Safety break if we go way past
+        if current_idx > original_idx + 1000:
+            break
+
+    if original_sample is None:
+        print(
+            "⚠️ Could not find corresponding sample in original dataset (by iteration). Trying to just take the nth element."
+        )
+        # Reset and take nth
+        ds_orig = load_dataset(orig_ds_id, split="train", streaming=True)
+        for i, item in enumerate(ds_orig):
+            if i == original_idx:
+                original_sample = item
+                break
+
+    if original_sample is None:
+        raise ValueError(f"Could not find sample {original_idx} in original dataset")
+
+    # Load tokenizer
+    print("Pre-loading tokenizer...")
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
+
+    # 4. Run Analysis
+    print("✨ Analyzing...")
+    analysis = analyze_token_probabilities(
+        logit_sample,
+        original_sample,
+        tokenizer,
+        chat_template=chat_template or config.get("chat_template_file"),
+        config=config,
+    )
+
+    # 5. Visualize
+    visualize_conversation_probabilities(analysis)
+
+    return analysis
