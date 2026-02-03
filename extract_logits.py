@@ -1289,6 +1289,21 @@ def run_extraction(config: ExtractionConfig, verify_mask: bool = False):
                 think_token_ids=think_tokens_tensor,
             )
 
+            # Update progress bar immediately after GPU returns (overlaps with async CPU work)
+            batch_size = batch["input_ids"].size(0)
+            num_tokens = gpu_metrics.num_tokens
+            pbar.update(batch_size)
+            pbar.set_postfix(
+                {
+                    "batch": f"{batch_size}x{num_tokens}tok",
+                    "gpu": f"{gpu_metrics.model_time_ms:.0f}ms",
+                    "cpu": f"{avg_postprocess_ms:.0f}ms",
+                    "tok/s": f"{avg_tok_per_sec:.0f}",
+                    "buf": len(uploader.buffer),
+                },
+                refresh=True
+            )
+
             if gpu_result is not None:
                 # Submit for async CPU post-processing (returns previous batch results)
                 prev_result = async_processor.submit(gpu_result, config, gpu_metrics)
@@ -1302,24 +1317,10 @@ def run_extraction(config: ExtractionConfig, verify_mask: bool = False):
                     if uploader.should_flush():
                         uploader.flush()
 
-                    # Update moving averages
+                    # Update moving averages from completed batch
                     avg_model_ms = ema_alpha * metrics.model_time_ms + (1 - ema_alpha) * avg_model_ms
                     avg_postprocess_ms = ema_alpha * metrics.postprocess_time_ms + (1 - ema_alpha) * avg_postprocess_ms
                     avg_tok_per_sec = ema_alpha * metrics.model_tokens_per_sec + (1 - ema_alpha) * avg_tok_per_sec
-
-            # Update progress bar
-            batch_size = batch["input_ids"].size(0)
-            pbar.update(batch_size)
-            pbar.set_postfix(
-                {
-                    "gpu": f"{avg_model_ms:.0f}ms",
-                    "cpu": f"{avg_postprocess_ms:.0f}ms",
-                    "tok/s": f"{avg_tok_per_sec:.0f}",
-                    "buf": len(uploader.buffer),
-                    "up": uploader.total_samples_uploaded,
-                },
-                refresh=True
-            )
 
             # Periodic cleanup
             if (batch_idx + 1) % 1000 == 0:
