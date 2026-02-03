@@ -497,18 +497,25 @@ class TokenBudgetBatchSampler(Sampler):
     def __init__(self, lengths: list[int], thresholds: dict, drop_last: bool = False):
         self.lengths = lengths
         self.indices = list(range(len(lengths)))
-        # Sort thresholds by length descending (longest first)
-        self.thresholds = sorted(thresholds.items(), key=lambda x: -x[0])
+        # Sort thresholds by length ASCENDING so we match the smallest fitting bucket first
+        self.thresholds = sorted(thresholds.items(), key=lambda x: x[0])
         self.drop_last = drop_last
         # Pre-compute number of batches for __len__
         self._num_batches = self._compute_num_batches()
 
     def _get_max_batch_size(self, length: int) -> int:
-        """Get max batch size for a given sequence length."""
+        """Get max batch size for a given sequence length.
+
+        Thresholds are sorted ascending. We find the smallest threshold >= length.
+        E.g., for thresholds {256: 16, 512: 8, 1024: 4}:
+          - length 200 -> matches 256 -> batch size 16
+          - length 500 -> matches 512 -> batch size 8
+          - length 2000 -> no match -> batch size 1
+        """
         for thr, cnt in self.thresholds:
             if length <= thr:
                 return cnt
-        return 1  # Default for very long sequences
+        return 1  # Default for very long sequences (longer than any threshold)
 
     def _compute_num_batches(self) -> int:
         """Compute total number of batches."""
