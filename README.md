@@ -245,18 +245,56 @@ The extraction supports graceful interruption and resume:
 
 ---
 
-## Requirements
+## Installation
 
+### Using uv (Recommended)
+
+[uv](https://github.com/astral-sh/uv) is a fast Python package manager. Install dependencies with:
+
+```bash
+# Install core dependencies
+uv sync
+
+# Include visualization tools (matplotlib, seaborn, termcolor)
+uv sync --extra viz
+
+# Include everything (viz + Jupyter)
+uv sync --extra all
 ```
-torch
-transformers
-datasets
-huggingface_hub
-pandas
-pyarrow
-numpy
-tqdm
-matplotlib  # for visualization
-seaborn     # for visualization
-termcolor   # for colored console output
+
+Run scripts directly with uv:
+
+```bash
+uv run python extract_logits.py --model ... --dataset ... --output ...
+uv run python compute_lengths.py --model ... --dataset ...
 ```
+
+### Using pip
+
+```bash
+# Install core dependencies
+pip install -e .
+
+# Include visualization tools
+pip install -e ".[viz]"
+
+# Include everything
+pip install -e ".[all]"
+```
+
+### Dependencies
+
+**Core** (required for extraction):
+- `torch` - GPU computation
+- `transformers` - Model loading, tokenization
+- `datasets` - HuggingFace dataset loading
+- `huggingface-hub` - Upload to Hub
+- `pandas`, `pyarrow` - Parquet I/O
+- `numpy`, `tqdm` - Utilities
+
+**Visualization** (`[viz]` extra):
+- `matplotlib`, `seaborn` - Plotting
+- `termcolor` - Colored console output
+
+**Development** (`[dev]` extra):
+- `jupyter`, `ipykernel` - Notebook support
