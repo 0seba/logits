@@ -36,6 +36,10 @@ import os
 from huggingface_hub import hf_hub_download
 from termcolor import colored
 import html
+import pyarrow as pa
+import pyarrow.dataset as pa_dataset
+from dataclasses import dataclass, field
+from tqdm.auto import tqdm
 
 # Constants
 UINT16_MAX = 65535
@@ -1267,6 +1271,649 @@ def visualize_conversation_probabilities(
             print(f"{token_colored:<30} | {predictions_str}")
 
         print("=" * 120)
+
+
+# =============================================================================
+# Nucleus Size Analysis (Streaming)
+# =============================================================================
+
+
+@dataclass
+class NucleusSizeStats:
+    """Statistics about nucleus sizes across a dataset."""
+
+    # Per-token statistics
+    all_sizes: np.ndarray  # All nucleus sizes (can be large!)
+    total_tokens: int
+    total_samples: int
+
+    # Aggregated statistics
+    min_size: int
+    max_size: int
+    mean_size: float
+    median_size: float
+    std_size: float
+    percentiles: Dict[
+        int, float
+    ]  # {5: val, 25: val, 50: val, 75: val, 95: val, 99: val}
+
+    # Size distribution (histogram-ready)
+    size_counts: Dict[int, int]  # {size: count}
+
+    # Per-sample statistics
+    samples_mean_sizes: np.ndarray  # Mean nucleus size per sample
+    samples_token_counts: np.ndarray  # Token count per sample
+
+    def __repr__(self):
+        return (
+            f"NucleusSizeStats(\n"
+            f"  total_samples={self.total_samples:,},\n"
+            f"  total_tokens={self.total_tokens:,},\n"
+            f"  min={self.min_size}, max={self.max_size},\n"
+            f"  mean={self.mean_size:.2f}, median={self.median_size:.1f}, std={self.std_size:.2f},\n"
+            f"  p5={self.percentiles[5]:.1f}, p95={self.percentiles[95]:.1f}, p99={self.percentiles[99]:.1f}\n"
+            f")"
+        )
+
+    def _repr_html_(self):
+        """Rich HTML representation for Jupyter notebooks."""
+        return f"""
+        <div style="font-family: monospace; background: #f5f5f5; padding: 15px; border-radius: 8px;">
+            <h3 style="margin-top: 0;">Nucleus Size Statistics</h3>
+            <table style="border-collapse: collapse;">
+                <tr><td style="padding: 4px 12px;"><b>Total Samples</b></td><td>{self.total_samples:,}</td></tr>
+                <tr><td style="padding: 4px 12px;"><b>Total Tokens</b></td><td>{self.total_tokens:,}</td></tr>
+                <tr><td style="padding: 4px 12px;"><b>Min Size</b></td><td>{self.min_size}</td></tr>
+                <tr><td style="padding: 4px 12px;"><b>Max Size</b></td><td>{self.max_size}</td></tr>
+                <tr><td style="padding: 4px 12px;"><b>Mean</b></td><td>{self.mean_size:.2f}</td></tr>
+                <tr><td style="padding: 4px 12px;"><b>Median</b></td><td>{self.median_size:.1f}</td></tr>
+                <tr><td style="padding: 4px 12px;"><b>Std Dev</b></td><td>{self.std_size:.2f}</td></tr>
+                <tr><td style="padding: 4px 12px;"><b>P5</b></td><td>{self.percentiles[5]:.1f}</td></tr>
+                <tr><td style="padding: 4px 12px;"><b>P25</b></td><td>{self.percentiles[25]:.1f}</td></tr>
+                <tr><td style="padding: 4px 12px;"><b>P75</b></td><td>{self.percentiles[75]:.1f}</td></tr>
+                <tr><td style="padding: 4px 12px;"><b>P95</b></td><td>{self.percentiles[95]:.1f}</td></tr>
+                <tr><td style="padding: 4px 12px;"><b>P99</b></td><td>{self.percentiles[99]:.1f}</td></tr>
+            </table>
+        </div>
+        """
+
+
+def analyze_nucleus_sizes(
+    dataset_id: str,
+    split: str = "train",
+    max_samples: Optional[int] = None,
+    batch_size: int = 1000,
+    collect_all_sizes: bool = True,
+    show_progress: bool = True,
+    device: Optional[str] = None,
+) -> NucleusSizeStats:
+    """
+    Analyze the distribution of nucleus sizes (extracted logits per token) across a dataset.
+
+    Uses streaming with optimizations from extract_logits.py for efficient processing
+    of large datasets without loading everything into memory.
+
+    Args:
+        dataset_id: HuggingFace dataset ID (e.g., "user/logits-dataset")
+        split: Dataset split to analyze (default: "train")
+        max_samples: Maximum number of samples to process (None = all)
+        batch_size: Batch size for streaming iteration (higher = faster but more memory)
+        collect_all_sizes: If True, collect all individual sizes for detailed analysis.
+                          Set to False for very large datasets to save memory.
+        show_progress: Whether to show a progress bar
+        device: PyTorch device for GPU acceleration (e.g., "cuda", "mps", or None for CPU/numpy).
+                When set, uses PyTorch tensors on the specified device for faster computation.
+
+    Returns:
+        NucleusSizeStats object with comprehensive statistics
+
+    Example (Jupyter notebook):
+        ```python
+        from explore_logits import analyze_nucleus_sizes, plot_nucleus_size_analysis
+
+        # Analyze the dataset (CPU)
+        stats = analyze_nucleus_sizes("user/my-logits", max_samples=10000)
+
+        # Analyze with GPU acceleration
+        stats = analyze_nucleus_sizes("user/my-logits", max_samples=10000, device="cuda")
+
+        # Display stats (rich HTML in Jupyter)
+        display(stats)
+
+        # Visualize
+        plot_nucleus_size_analysis(stats)
+        ```
+    """
+    import time
+
+    print(f"📊 Analyzing nucleus sizes in: {dataset_id}")
+
+    # Timing accumulators
+    timings = {
+        "batch_iteration": 0.0,
+        "data_conversion": 0.0,
+        "gpu_transfer": 0.0,
+        "gpu_compute": 0.0,
+        "per_sample_stats": 0.0,
+        "histogram": 0.0,
+        "collect_sizes": 0.0,
+    }
+
+    # Set up device for GPU acceleration
+    use_gpu = device is not None
+    if use_gpu:
+        torch_device = torch.device(device)
+        print(f"🚀 Using PyTorch acceleration on device: {torch_device}")
+
+    t_setup_start = time.perf_counter()
+
+    # OPTIMIZATION: Enable prefetching and larger buffer for faster streaming
+    # (Same optimization used in extract_logits.py get_resume_info)
+    fragment_scan_options = pa_dataset.ParquetFragmentScanOptions(
+        cache_options=pa.CacheOptions(
+            prefetch_limit=10_000,  # Prefetch next chunk while processing current
+            range_size_limit=128 << 20,  # 128 MiB block size
+        ),
+    )
+
+    # OPTIMIZATION: Only load the columns we need
+    ds = load_dataset(
+        dataset_id,
+        split=split,
+        streaming=True,
+        columns=["top_counts", "num_tokens"],
+        fragment_scan_options=fragment_scan_options,
+    )
+
+    print(f"⏱️  Dataset setup: {time.perf_counter() - t_setup_start:.3f}s")
+
+    # Collectors
+    all_sizes_list = [] if collect_all_sizes else None
+    size_counts: Dict[int, int] = defaultdict(int)
+    samples_mean_sizes = []
+    samples_token_counts = []
+
+    total_tokens = 0
+    total_samples = 0
+
+    # Running stats for when we don't collect all sizes
+    running_sum = 0
+    running_sum_sq = 0
+    global_min = float("inf")
+    global_max = float("-inf")
+
+    # OPTIMIZATION: Batch iteration instead of row-by-row (~10x faster)
+    iterator = ds.batch(batch_size=batch_size)
+
+    # Progress bar: show sample count with total if max_samples is set
+    pbar = None
+    if show_progress:
+        pbar = tqdm(
+            total=max_samples,
+            desc="Analyzing nucleus sizes",
+            unit="samples",
+            dynamic_ncols=True,
+        )
+
+    t_loop_start = time.perf_counter()
+    t_batch_start = time.perf_counter()
+
+    for batch in iterator:
+        timings["batch_iteration"] += time.perf_counter() - t_batch_start
+
+        batch_top_counts = batch["top_counts"]
+        batch_num_tokens = batch["num_tokens"]
+        batch_samples_processed = 0
+
+        if use_gpu:
+            # GPU-accelerated batch processing
+            # Collect all counts from this batch and process together
+            batch_counts_list = []
+            batch_lengths = []
+            batch_valid_indices = []
+
+            for i, (sample_counts, num_tokens) in enumerate(
+                zip(batch_top_counts, batch_num_tokens)
+            ):
+                if (
+                    max_samples is not None
+                    and total_samples + len(batch_valid_indices) >= max_samples
+                ):
+                    break
+                if len(sample_counts) == 0:
+                    continue
+                batch_counts_list.append(sample_counts)
+                batch_lengths.append(len(sample_counts))
+                batch_valid_indices.append(i)
+
+            if batch_counts_list:
+                # Concatenate all counts and move to GPU
+                t0 = time.perf_counter()
+                all_batch_counts = np.concatenate(
+                    [np.array(c, dtype=np.int32) for c in batch_counts_list]
+                )
+                timings["data_conversion"] += time.perf_counter() - t0
+
+                t0 = time.perf_counter()
+                counts_tensor = torch.from_numpy(all_batch_counts).to(torch_device)
+                if torch_device.type == "cuda":
+                    torch.cuda.synchronize()
+                elif torch_device.type == "mps":
+                    torch.mps.synchronize()
+                timings["gpu_transfer"] += time.perf_counter() - t0
+
+                # Compute global stats on GPU
+                t0 = time.perf_counter()
+                batch_min = counts_tensor.min().item()
+                batch_max = counts_tensor.max().item()
+                batch_sum = counts_tensor.sum().item()
+                batch_sum_sq = (counts_tensor.float() ** 2).sum().item()
+                timings["gpu_compute"] += time.perf_counter() - t0
+
+                global_min = min(global_min, batch_min)
+                global_max = max(global_max, batch_max)
+                running_sum += batch_sum
+                running_sum_sq += batch_sum_sq
+
+                # Compute per-sample means on GPU using segment reduction
+                t0 = time.perf_counter()
+                lengths_tensor = torch.tensor(batch_lengths, device=torch_device)
+                offsets = torch.cat(
+                    [
+                        torch.tensor([0], device=torch_device),
+                        lengths_tensor.cumsum(0)[:-1],
+                    ]
+                )
+
+                for idx, length in enumerate(batch_lengths):
+                    start = offsets[idx].item()
+                    end = start + length
+                    sample_mean = counts_tensor[start:end].float().mean().item()
+                    samples_mean_sizes.append(sample_mean)
+                    samples_token_counts.append(length)
+                timings["per_sample_stats"] += time.perf_counter() - t0
+
+                # Histogram: use torch.unique on GPU, then update dict on CPU
+                t0 = time.perf_counter()
+                unique_vals, unique_cnts = torch.unique(
+                    counts_tensor, return_counts=True
+                )
+                unique_vals = unique_vals.cpu().numpy()
+                unique_cnts = unique_cnts.cpu().numpy()
+                for size, cnt in zip(unique_vals, unique_cnts):
+                    size_counts[int(size)] += int(cnt)
+                timings["histogram"] += time.perf_counter() - t0
+
+                # Collect sizes if needed (keep on CPU as numpy)
+                t0 = time.perf_counter()
+                if collect_all_sizes:
+                    offset = 0
+                    counts_np = all_batch_counts
+                    for length in batch_lengths:
+                        all_sizes_list.append(
+                            counts_np[offset : offset + length].copy()
+                        )
+                        offset += length
+                timings["collect_sizes"] += time.perf_counter() - t0
+
+                total_tokens += len(all_batch_counts)
+                total_samples += len(batch_lengths)
+                batch_samples_processed = len(batch_lengths)
+        else:
+            # CPU/numpy processing (original code path)
+            for sample_counts, num_tokens in zip(batch_top_counts, batch_num_tokens):
+                if max_samples is not None and total_samples >= max_samples:
+                    break
+
+                # Convert to numpy for efficient processing
+                t0 = time.perf_counter()
+                counts = np.array(sample_counts, dtype=np.int32)
+                timings["data_conversion"] += time.perf_counter() - t0
+
+                if len(counts) == 0:
+                    continue
+
+                # Per-sample stats
+                t0 = time.perf_counter()
+                sample_mean = counts.mean()
+                samples_mean_sizes.append(sample_mean)
+                samples_token_counts.append(len(counts))
+
+                sample_min = counts.min()
+                sample_max = counts.max()
+                global_min = min(global_min, sample_min)
+                global_max = max(global_max, sample_max)
+
+                running_sum += counts.sum()
+                running_sum_sq += (counts.astype(np.float64) ** 2).sum()
+                timings["per_sample_stats"] += time.perf_counter() - t0
+
+                # Update global stats
+                total_tokens += len(counts)
+                total_samples += 1
+                batch_samples_processed += 1
+
+                # Collect sizes
+                t0 = time.perf_counter()
+                if collect_all_sizes:
+                    all_sizes_list.append(counts)
+                timings["collect_sizes"] += time.perf_counter() - t0
+
+                # Update histogram
+                t0 = time.perf_counter()
+                unique, unique_counts = np.unique(counts, return_counts=True)
+                for size, cnt in zip(unique, unique_counts):
+                    size_counts[size] += cnt
+                timings["histogram"] += time.perf_counter() - t0
+
+        # Update progress bar after each batch
+        if pbar is not None:
+            pbar.update(batch_samples_processed)
+            pbar.set_postfix(
+                tokens=f"{total_tokens:,}",
+                avg=f"{running_sum / total_tokens:.1f}" if total_tokens > 0 else "N/A",
+            )
+
+        if max_samples is not None and total_samples >= max_samples:
+            break
+
+        t_batch_start = time.perf_counter()
+
+    if pbar is not None:
+        pbar.close()
+
+    # Print timing breakdown
+    total_time = time.perf_counter() - t_loop_start
+    print(f"\n⏱️  Timing breakdown (total loop: {total_time:.2f}s):")
+    for name, t in sorted(timings.items(), key=lambda x: -x[1]):
+        pct = (t / total_time * 100) if total_time > 0 else 0
+        bar = "█" * int(pct / 2) + "░" * (50 - int(pct / 2))
+        print(f"  {name:20s}: {t:7.2f}s ({pct:5.1f}%) {bar}")
+
+    if total_samples == 0:
+        raise ValueError("No samples found in dataset")
+
+    # Compute final statistics
+    if collect_all_sizes and all_sizes_list:
+        all_sizes = np.concatenate(all_sizes_list)
+        mean_size = all_sizes.mean()
+        std_size = all_sizes.std()
+        median_size = np.median(all_sizes)
+        percentiles = {p: np.percentile(all_sizes, p) for p in [5, 25, 50, 75, 95, 99]}
+    else:
+        # Compute from running stats
+        all_sizes = np.array([], dtype=np.int32)
+        mean_size = running_sum / total_tokens if total_tokens > 0 else 0
+        variance = (
+            (running_sum_sq / total_tokens) - (mean_size**2) if total_tokens > 0 else 0
+        )
+        std_size = np.sqrt(max(0, variance))
+
+        # Estimate percentiles from histogram
+        sorted_sizes = sorted(size_counts.keys())
+        cumsum = 0
+        percentiles = {}
+        for p in [5, 25, 50, 75, 95, 99]:
+            target = total_tokens * p / 100
+            for size in sorted_sizes:
+                cumsum += size_counts[size]
+                if cumsum >= target and p not in percentiles:
+                    percentiles[p] = float(size)
+                    break
+            if p not in percentiles:
+                percentiles[p] = float(sorted_sizes[-1]) if sorted_sizes else 0
+
+        median_size = percentiles[50]
+
+    print(f"✅ Analyzed {total_samples:,} samples with {total_tokens:,} tokens")
+
+    return NucleusSizeStats(
+        all_sizes=all_sizes,
+        total_tokens=total_tokens,
+        total_samples=total_samples,
+        min_size=int(global_min) if global_min != float("inf") else 0,
+        max_size=int(global_max) if global_max != float("-inf") else 0,
+        mean_size=float(mean_size),
+        median_size=float(median_size),
+        std_size=float(std_size),
+        percentiles=percentiles,
+        size_counts=dict(size_counts),
+        samples_mean_sizes=np.array(samples_mean_sizes),
+        samples_token_counts=np.array(samples_token_counts),
+    )
+
+
+def plot_nucleus_size_analysis(
+    stats: NucleusSizeStats,
+    figsize: tuple = (14, 10),
+    max_size_display: Optional[int] = None,
+):
+    """
+    Create comprehensive visualizations of nucleus size statistics.
+
+    Best viewed in a Jupyter notebook for interactive exploration.
+
+    Args:
+        stats: NucleusSizeStats object from analyze_nucleus_sizes()
+        figsize: Figure size (width, height)
+        max_size_display: Maximum nucleus size to display in histograms (None = auto)
+
+    Example:
+        ```python
+        stats = analyze_nucleus_sizes("user/my-logits")
+        plot_nucleus_size_analysis(stats)
+        ```
+    """
+    fig, axes = plt.subplots(2, 2, figsize=figsize)
+
+    # Determine max size for display
+    if max_size_display is None:
+        max_size_display = min(stats.max_size, int(stats.percentiles[99] * 1.5))
+
+    # 1. Histogram of nucleus sizes (from size_counts)
+    ax1 = axes[0, 0]
+    sizes = sorted([s for s in stats.size_counts.keys() if s <= max_size_display])
+    counts = [stats.size_counts[s] for s in sizes]
+
+    ax1.bar(
+        sizes, counts, color="steelblue", alpha=0.7, edgecolor="black", linewidth=0.5
+    )
+    ax1.axvline(
+        stats.mean_size,
+        color="red",
+        linestyle="--",
+        linewidth=2,
+        label=f"Mean: {stats.mean_size:.1f}",
+    )
+    ax1.axvline(
+        stats.median_size,
+        color="orange",
+        linestyle="-.",
+        linewidth=2,
+        label=f"Median: {stats.median_size:.1f}",
+    )
+    ax1.set_xlabel("Nucleus Size (logits per token)")
+    ax1.set_ylabel("Count")
+    ax1.set_title("Distribution of Nucleus Sizes")
+    ax1.legend()
+    ax1.grid(axis="y", alpha=0.3)
+    ax1.set_xlim(0, max_size_display + 1)
+
+    # 2. Log-scale histogram for better tail visibility
+    ax2 = axes[0, 1]
+    ax2.bar(sizes, counts, color="coral", alpha=0.7, edgecolor="black", linewidth=0.5)
+    ax2.set_yscale("log")
+    ax2.axvline(
+        stats.percentiles[95],
+        color="green",
+        linestyle=":",
+        linewidth=2,
+        label=f"P95: {stats.percentiles[95]:.0f}",
+    )
+    ax2.axvline(
+        stats.percentiles[99],
+        color="purple",
+        linestyle=":",
+        linewidth=2,
+        label=f"P99: {stats.percentiles[99]:.0f}",
+    )
+    ax2.set_xlabel("Nucleus Size (logits per token)")
+    ax2.set_ylabel("Count (log scale)")
+    ax2.set_title("Nucleus Size Distribution (Log Scale)")
+    ax2.legend()
+    ax2.grid(axis="y", alpha=0.3)
+    ax2.set_xlim(0, max_size_display + 1)
+
+    # 3. Per-sample mean nucleus size distribution
+    ax3 = axes[1, 0]
+    ax3.hist(
+        stats.samples_mean_sizes,
+        bins=50,
+        color="mediumseagreen",
+        alpha=0.7,
+        edgecolor="black",
+    )
+    ax3.axvline(
+        stats.samples_mean_sizes.mean(),
+        color="red",
+        linestyle="--",
+        linewidth=2,
+        label=f"Mean of means: {stats.samples_mean_sizes.mean():.1f}",
+    )
+    ax3.set_xlabel("Mean Nucleus Size per Sample")
+    ax3.set_ylabel("Number of Samples")
+    ax3.set_title("Distribution of Per-Sample Mean Nucleus Sizes")
+    ax3.legend()
+    ax3.grid(axis="y", alpha=0.3)
+
+    # 4. Tokens per sample vs mean nucleus size scatter
+    ax4 = axes[1, 1]
+    # Subsample if too many points
+    max_points = 5000
+    if len(stats.samples_mean_sizes) > max_points:
+        idx = np.random.choice(len(stats.samples_mean_sizes), max_points, replace=False)
+        x = stats.samples_token_counts[idx]
+        y = stats.samples_mean_sizes[idx]
+        alpha = 0.3
+    else:
+        x = stats.samples_token_counts
+        y = stats.samples_mean_sizes
+        alpha = 0.5
+
+    ax4.scatter(x, y, alpha=alpha, s=10, c="steelblue")
+    ax4.set_xlabel("Tokens per Sample")
+    ax4.set_ylabel("Mean Nucleus Size")
+    ax4.set_title("Tokens vs Mean Nucleus Size per Sample")
+    ax4.grid(alpha=0.3)
+
+    plt.tight_layout()
+    plt.show()
+
+    # Print summary
+    print("\n" + "=" * 60)
+    print("NUCLEUS SIZE SUMMARY")
+    print("=" * 60)
+    print(f"Total samples: {stats.total_samples:,}")
+    print(f"Total tokens:  {stats.total_tokens:,}")
+    print(f"Avg tokens/sample: {stats.total_tokens / stats.total_samples:.1f}")
+    print(f"\nNucleus size statistics:")
+    print(f"  Min:    {stats.min_size}")
+    print(f"  Max:    {stats.max_size}")
+    print(f"  Mean:   {stats.mean_size:.2f}")
+    print(f"  Median: {stats.median_size:.1f}")
+    print(f"  Std:    {stats.std_size:.2f}")
+    print(f"\nPercentiles:")
+    print(f"  P5:  {stats.percentiles[5]:.1f}")
+    print(f"  P25: {stats.percentiles[25]:.1f}")
+    print(f"  P50: {stats.percentiles[50]:.1f}")
+    print(f"  P75: {stats.percentiles[75]:.1f}")
+    print(f"  P95: {stats.percentiles[95]:.1f}")
+    print(f"  P99: {stats.percentiles[99]:.1f}")
+
+    # Estimate storage savings
+    avg_nucleus = stats.mean_size
+    max_nucleus = 100  # Default max from extract_logits.py
+    savings_pct = (1 - avg_nucleus / max_nucleus) * 100
+    print(f"\nStorage efficiency:")
+    print(f"  Avg nucleus size: {avg_nucleus:.1f} (max: {max_nucleus})")
+    print(f"  Storage saved: ~{savings_pct:.1f}% vs fixed-size extraction")
+    print("=" * 60)
+
+
+def compute_bytes_per_token_stats(
+    stats: NucleusSizeStats, sampled_n: int = 24
+) -> Dict[str, float]:
+    """
+    Compute storage bytes per token based on nucleus size statistics.
+
+    Args:
+        stats: NucleusSizeStats from analyze_nucleus_sizes()
+        sampled_n: Number of sampled logits (default: 24)
+
+    Returns:
+        Dictionary with bytes per token statistics
+
+    Example:
+        ```python
+        stats = analyze_nucleus_sizes("user/my-logits")
+        bytes_stats = compute_bytes_per_token_stats(stats)
+        print(f"Average bytes/token: {bytes_stats['mean']:.1f}")
+        ```
+    """
+
+    def bytes_for_nucleus_size(n: int) -> int:
+        """Calculate bytes for a given nucleus size."""
+        # Nucleus data
+        nucleus_bytes = (
+            n * 2  # indices_low (uint16)
+            + (n + 3) // 4  # indices_high (packed 2-bit, ceil division)
+            + n * 2  # logits_quantized (uint16)
+            + 1  # count (uint8)
+            + 4  # min (float32)
+            + 4  # max (float32)
+        )
+
+        # Sampled data (fixed size)
+        sampled_bytes = (
+            sampled_n * 2  # indices_low
+            + (sampled_n + 3) // 4  # indices_high
+            + sampled_n * 2  # logits_quantized
+            + 4  # min
+            + 4  # max
+        )
+
+        # Other
+        other_bytes = 8  # logsumexp (float64)
+
+        return nucleus_bytes + sampled_bytes + other_bytes
+
+    # Compute for percentiles and mean
+    mean_bytes = bytes_for_nucleus_size(int(round(stats.mean_size)))
+    median_bytes = bytes_for_nucleus_size(int(round(stats.median_size)))
+    min_bytes = bytes_for_nucleus_size(stats.min_size)
+    max_bytes = bytes_for_nucleus_size(stats.max_size)
+    p95_bytes = bytes_for_nucleus_size(int(round(stats.percentiles[95])))
+    p99_bytes = bytes_for_nucleus_size(int(round(stats.percentiles[99])))
+
+    # Weighted average from histogram
+    if stats.size_counts:
+        total_bytes = sum(
+            bytes_for_nucleus_size(size) * count
+            for size, count in stats.size_counts.items()
+        )
+        weighted_mean_bytes = total_bytes / stats.total_tokens
+    else:
+        weighted_mean_bytes = mean_bytes
+
+    return {
+        "mean": weighted_mean_bytes,
+        "median": median_bytes,
+        "min": min_bytes,
+        "max": max_bytes,
+        "p95": p95_bytes,
+        "p99": p99_bytes,
+        "fixed_100": bytes_for_nucleus_size(100),  # For comparison
+    }
 
 
 def quick_explore(

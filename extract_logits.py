@@ -306,7 +306,7 @@ class StreamingHFUploader:
                 ("sampled_logits_quantized", pa.list_(pa.uint16())),
                 ("sampled_min", pa.list_(pa.float32())),
                 ("sampled_max", pa.list_(pa.float32())),
-                ("logsumexp", pa.list_(pa.float32())),
+                ("logsumexp", pa.list_(pa.float64())),
             ]
         )
 
@@ -1011,10 +1011,10 @@ def gpu_process_batch(
         logits = model.lm_head(hidden_states[extract_positions])  # (N, vocab)
         metrics.num_tokens = N
 
-        # Compute logsumexp for normalization info
-        logits_f = logits.float()
-        lse = torch.logsumexp(logits_f, dim=-1)
-        probs = torch.exp(logits_f - lse.unsqueeze(-1))
+        # Compute logsumexp and probabilities in double precision for accuracy
+        logits_d = logits.double()
+        lse = torch.logsumexp(logits_d, dim=-1)  # double precision logsumexp
+        probs = torch.exp(logits_d - lse.unsqueeze(-1))  # probs in double precision
 
         # Count tokens per sample in batch
         sizes = assistant_mask.sum(dim=-1).tolist()
@@ -1046,7 +1046,7 @@ def gpu_process_batch(
         # This is much faster than variable-length extraction
         k = config.top_p_max_elements
         top_indices = sorted_idx[:, :k]  # (N, k) - original vocab indices
-        top_logits = logits_f.gather(-1, top_indices)  # (N, k)
+        top_logits = logits_d.gather(-1, top_indices)  # (N, k) double precision
 
         # Quantize nucleus logits on GPU (vectorized per-row)
         top_min = top_logits.min(dim=-1).values  # (N,)
@@ -1069,25 +1069,21 @@ def gpu_process_batch(
         valid_cols = top_indices[col_mask]
         nucleus_mask_vocab[valid_rows, valid_cols] = True
 
-        # Prepare sampling distribution
-        probs_rest = probs.clone()
-        probs_rest[nucleus_mask_vocab] = 0.0
-        rest_sum = probs_rest.sum(dim=-1, keepdim=True)
+        # Log-space sampling using Gumbel-max trick (avoids probability underflow)
+        # This samples proportionally to true probabilities even when they're tiny
+        log_probs = logits_d - lse.unsqueeze(-1)  # log(p_i) in double precision
+        log_probs[nucleus_mask_vocab] = float('-inf')  # exclude nucleus tokens
 
-        # Handle edge case: all probability in nucleus
-        zero_rest = rest_sum.squeeze(-1) < 1e-10
-        if zero_rest.any():
-            uniform_mask = ~nucleus_mask_vocab[zero_rest]
-            counts = uniform_mask.sum(dim=-1, keepdim=True).float().clamp(min=1.0)
-            probs_rest[zero_rest] = uniform_mask.float() / counts
-            rest_sum = probs_rest.sum(dim=-1, keepdim=True)
+        # Gumbel-max trick: argmax(log_prob + Gumbel) ~ Categorical(prob)
+        # For top-k sampling: topk(log_prob + Gumbel) gives k samples without replacement
+        uniform = torch.rand(N, vocab_size, device=device, dtype=torch.float64)
+        uniform = uniform.clamp(min=1e-10, max=1 - 1e-10)  # avoid log(0)
+        gumbel = -torch.log(-torch.log(uniform))  # Gumbel(0, 1) samples
+        perturbed = log_probs + gumbel
 
-        # Renormalize
-        probs_rest = probs_rest / rest_sum.clamp(min=1e-30)
-
-        # Sample from remaining distribution
-        sampled_idx = torch.multinomial(probs_rest, config.sampled_n)
-        sampled_logits = logits_f.gather(-1, sampled_idx)
+        # Top-k gives k samples weighted by probability (no uniform fallback needed)
+        _, sampled_idx = torch.topk(perturbed, config.sampled_n, dim=-1)
+        sampled_logits = logits_d.gather(-1, sampled_idx)  # double precision
 
         # Quantize sampled logits on GPU
         samp_min = sampled_logits.min(dim=-1).values
@@ -1115,7 +1111,7 @@ def gpu_process_batch(
             sampled_logits=samp_quantized.cpu().numpy().astype(np.uint16),
             sampled_min=samp_min.cpu().numpy().astype(np.float32),
             sampled_max=samp_max.cpu().numpy().astype(np.float32),
-            logsumexp=lse.cpu().numpy().astype(np.float32),
+            logsumexp=lse.cpu().numpy().astype(np.float64),
             sizes=sizes,
             indexes=indexes,
         )

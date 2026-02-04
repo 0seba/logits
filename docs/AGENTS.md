@@ -32,24 +32,25 @@ logits/
 
 | Class | Location | Purpose |
 |-------|----------|---------|
-| `ExtractionConfig` | L126-205 | Dataclass holding all configuration options |
-| `StreamingHFUploader` | L212-412 | Handles incremental upload to HuggingFace Hub |
-| `GracefulInterrupt` | L420-445 | Signal handler for graceful Ctrl+C shutdown |
-| `ConversationDataset` | L453-481 | PyTorch Dataset wrapping conversations |
-| `TokenBudgetBatchSampler` | L484-568 | Dynamic batch sizing based on sequence length |
-| `GPUBatchResult` | L669-687 | Dataclass for GPU→CPU transfer |
-| `AsyncPostProcessor` | L939-985 | Async CPU post-processing while GPU runs next batch |
+| `ExtractionConfig` | L128-215 | Dataclass holding all configuration options |
+| `StreamingHFUploader` | L222-615 | Handles incremental upload to HuggingFace Hub with async support and local caching |
+| `GracefulInterrupt` | L623-651 | Signal handler for graceful Ctrl+C shutdown with local data preservation |
+| `TimedShutdown` | L654-706 | Automatic shutdown after configurable runtime with local checkpoint |
+| `ConversationDataset` | L713-741 | PyTorch Dataset wrapping conversations |
+| `TokenBudgetBatchSampler` | L744-828 | Dynamic batch sizing based on sequence length |
+| `GPUBatchResult` | L929-947 | Dataclass for GPU→CPU transfer |
+| `AsyncPostProcessor` | L1199-1245 | Async CPU post-processing while GPU runs next batch |
 
 **Key Functions**:
 
 | Function | Location | Purpose |
 |----------|----------|---------|
-| `pack_indices()` | L84-118 | Compress 32-bit indices to uint16 + packed 2-bit high bits |
-| `gpu_process_batch()` | L689-863 | GPU processing: forward pass, nucleus extraction, sampling |
-| `cpu_postprocess_batch()` | L866-936 | CPU post-processing: pack indices, create output dicts |
-| `prepare_dataset()` | L1013-1146 | Load dataset, apply filters, sort by length |
-| `run_extraction()` | L1154-1351 | Main orchestration loop |
-| `parse_args()` | L1359-1531 | CLI argument parsing |
+| `pack_indices()` | L86-120 | Compress 32-bit indices to uint16 + packed 2-bit high bits |
+| `gpu_process_batch()` | L949-1123 | GPU processing: forward pass, nucleus extraction, sampling |
+| `cpu_postprocess_batch()` | L1126-1196 | CPU post-processing: pack indices, create output dicts |
+| `prepare_dataset()` | L1273-1406 | Load dataset, apply filters, sort by length |
+| `run_extraction()` | L1414-1644 | Main orchestration loop |
+| `parse_args()` | L1652-1838 | CLI argument parsing |
 
 **Data Flow**:
 ```
@@ -58,23 +59,61 @@ Dataset → prepare_dataset() → ConversationDataset → TokenBudgetBatchSample
     → StreamingHFUploader → HuggingFace Hub
 ```
 
+**Async Upload Pipeline**:
+The `StreamingHFUploader` uses a background `ThreadPoolExecutor` for non-blocking uploads:
+```
+Buffer fills → flush() called → previous upload awaited → buffer converted to parquet
+    → upload submitted to executor → processing continues immediately
+    → final flush() is synchronous to ensure completion
+```
+
+**Local Caching & Graceful Shutdown**:
+On interruption (Ctrl+C, SIGTERM) or timed shutdown, unflushed data is preserved:
+```
+Interrupt/Timeout → save_pending_locally() → .logit_extraction_cache/pending/pending-XXXXX.parquet
+    → Next run with --resume → load_pending_into_buffer() → data merged with new samples → uploaded together
+```
+
 **Critical Implementation Details**:
 
 1. **Assistant Mask**: Uses `tokenizer.apply_chat_template(..., return_assistant_tokens_mask=True)` to identify which tokens are model outputs. Only these tokens have logits extracted.
 
-2. **Nucleus Extraction** (L762-796): Vectorized on GPU, no Python loops:
+2. **Double Precision Computation** (L1014-1017): All probability and logsumexp computations use float64 for numerical accuracy, avoiding issues with peaked distributions where float32 would show top_logit == logsumexp.
+
+3. **Nucleus Extraction** (L1022-1056): Vectorized on GPU in double precision, no Python loops:
    ```python
    sorted_probs, sorted_idx = torch.sort(probs, dim=-1, descending=True)
    cumsum_probs = torch.cumsum(sorted_probs, dim=-1)
    nucleus_mask = cumsum_probs <= config.top_p
    ```
 
-3. **Sampling from Remaining Vocab** (L798-837): Creates mask for already-selected tokens, samples from rest using `torch.multinomial()`.
+4. **Sampling from Remaining Vocab** (L1072-1086): Uses Gumbel-max trick in log-space (double precision) to sample from non-nucleus tokens proportionally to their true probabilities, avoiding underflow issues with tiny probabilities.
 
-4. **Quantization**: Logits quantized to uint16 per-row with min/max scaling:
+5. **Quantization**: Logits quantized to uint16 per-row with min/max scaling:
    ```python
    scaled = ((logits - min) / (max - min) * 65535).round()
    ```
+
+6. **Async Upload** (L336-416): Uploads run in a background thread while GPU/CPU processing continues:
+   - `_do_upload()`: Performs actual HuggingFace upload, saves backup on failure
+   - `_wait_for_pending_upload()`: Blocks until previous upload completes (called before new upload)
+   - Buffer is cleared immediately after converting to parquet bytes, not after upload completes
+
+7. **Local Caching on Interruption** (L418-514):
+   - `save_pending_locally()`: Saves unflushed buffer to `.logit_extraction_cache/pending/` directory
+   - `load_pending_into_buffer()`: On `--resume`, loads pending files back into buffer and deletes them
+   - Pending data merges with new samples and uploads together (avoids tiny chunks)
+
+8. **Resume & Dataset Verification Optimizations** (L548-615):
+   - Uses `ParquetFragmentScanOptions` with prefetching for faster streaming reads
+   - Batch iteration (`ds.batch(batch_size=10000)`) instead of row-by-row (~10x faster)
+   - Only fetches `index` column to minimize data transfer
+   - Combines local checkpoint with HuggingFace verification for robust resume
+
+9. **Size-Based Upload Threshold** (L277-288):
+   - `--upload-size-mb` triggers upload when buffer reaches target size in MB
+   - More predictable chunk sizes vs sample-count-based upload
+   - `_estimate_sample_size()` tracks buffer size incrementally
 
 ### 2. explore_logits.py (1400 lines)
 
@@ -91,6 +130,7 @@ Dataset → prepare_dataset() → ConversationDataset → TokenBudgetBatchSample
 | `dequantize_top_logits()` | L353-381 | Get nucleus indices+logits for a token |
 | `dequantize_sampled_logits()` | L384-411 | Get sampled indices+logits for a token |
 | `logits_to_probs()` | L454-477 | Convert logits to probabilities using logsumexp |
+| `analyze_nucleus_sizes()` | L1341-1533 | Analyze nucleus size distribution with optional GPU acceleration |
 | `analyze_token_probabilities()` | L848-1094 | Align logits with original text |
 | `visualize_conversation_probabilities()` | L1097-1269 | Color-coded visualization |
 
@@ -129,9 +169,32 @@ sample = {
 
 ### Adding a New CLI Argument
 
-1. Add to `parse_args()` in extract_logits.py (~L1359)
-2. Add corresponding field to `ExtractionConfig` dataclass (~L126)
-3. Wire it up in `main()` when creating the config (~L1557)
+1. Add to `parse_args()` in extract_logits.py (~L1652)
+2. Add corresponding field to `ExtractionConfig` dataclass (~L128)
+3. Wire it up in `main()` when creating the config (~L1864)
+
+### Key CLI Options for Robustness
+
+**Resumable Extraction**:
+```bash
+# First run (or interrupted run)
+python extract_logits.py --model ... --dataset ... --output ...
+
+# Resume from where it left off
+python extract_logits.py --model ... --dataset ... --output ... --resume
+```
+
+**Timed Execution** (for time-limited environments):
+```bash
+# Run for 55 minutes, then save and exit gracefully
+python extract_logits.py ... --max-runtime-minutes 55 --resume
+```
+
+**Size-Based Uploads** (for consistent chunk sizes):
+```bash
+# Upload when buffer reaches ~100MB instead of every N samples
+python extract_logits.py ... --upload-size-mb 100
+```
 
 ### Modifying Nucleus Extraction
 
@@ -178,7 +241,7 @@ schema = pa.schema([
     ("sampled_logits_quantized", pa.list_(pa.uint16())),
     ("sampled_min", pa.list_(pa.float32())),
     ("sampled_max", pa.list_(pa.float32())),
-    ("logsumexp", pa.list_(pa.float32())),
+    ("logsumexp", pa.list_(pa.float64())),  # double precision for accuracy
 ])
 ```
 
@@ -264,9 +327,30 @@ uv sync --extra all
 
 2. **CPU Bottleneck**: `cpu_postprocess_batch()` runs async while GPU processes next batch. If CPU is slower, consider reducing nucleus size or sampled count.
 
-3. **Upload Frequency**: `--upload-every` controls chunk size. Larger = fewer uploads but more data at risk on crash.
+3. **Upload Frequency**: Two modes available:
+   - `--upload-every N`: Upload every N samples (default 500)
+   - `--upload-size-mb X`: Upload when buffer reaches X MB (more predictable chunk sizes)
 
 4. **Streaming**: Both datasets support streaming mode for datasets that don't fit in RAM.
+
+5. **Async Uploads**: Uploads run in background while processing continues. The progress bar shows `⬆` when an upload is in progress. This significantly improves throughput on slow network connections.
+
+6. **Resume Verification**: On `--resume`, the pipeline verifies existing data using optimized batch iteration with prefetching. This is ~10x faster than row-by-row iteration for large datasets.
+
+7. **Timed Execution**: Use `--max-runtime-minutes` for time-limited environments (e.g., spot instances, shared GPUs). Unflushed data is saved locally and uploaded on next `--resume`.
+
+8. **Analysis GPU Acceleration**: `analyze_nucleus_sizes()` supports a `device` parameter for PyTorch GPU acceleration:
+   ```python
+   # CPU (default)
+   stats = analyze_nucleus_sizes("user/my-logits")
+
+   # GPU acceleration (CUDA)
+   stats = analyze_nucleus_sizes("user/my-logits", device="cuda")
+
+   # Apple Silicon (MPS)
+   stats = analyze_nucleus_sizes("user/my-logits", device="mps")
+   ```
+   GPU acceleration batches computations across samples for faster histogram and statistics computation on large datasets.
 
 ## Common Issues
 
@@ -281,3 +365,19 @@ Pre-compute lengths with `compute_lengths.py` to enable sorted batching. This dr
 
 ### Misaligned analysis
 Ensure you use the **same chat template** for analysis as was used for extraction.
+
+### Resume not finding previous progress
+1. Check that `--resume` flag is passed
+2. Verify `.logit_extraction_cache/checkpoint.json` exists (local checkpoint)
+3. Check HuggingFace dataset has data uploaded
+4. Use `--force-restart` to ignore existing progress if needed
+
+### Pending files not uploading
+If `.logit_extraction_cache/pending/` contains parquet files after a crash:
+1. Run with `--resume` - pending files are automatically loaded and merged
+2. If merge fails, manually inspect files with `pq.read_table()`
+
+### Upload timeouts on slow connections
+- Use `--upload-size-mb` with smaller values (e.g., 50MB) for more frequent, smaller uploads
+- The async upload system allows processing to continue during uploads
+- Failed uploads are saved to `.logit_extraction_cache/backup_*` for manual retry
