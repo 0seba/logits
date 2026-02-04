@@ -44,6 +44,7 @@ import time
 import numpy as np
 import pandas as pd
 import pyarrow as pa
+import pyarrow.dataset as pa_dataset
 import pyarrow.parquet as pq
 import torch
 from datasets import load_dataset
@@ -575,14 +576,28 @@ class StreamingHFUploader:
 
         # Verify against HuggingFace dataset
         try:
-            # OPTIMIZATION: Only fetch index column
+            # OPTIMIZATION: Enable prefetching and larger buffer for faster streaming
+            fragment_scan_options = pa_dataset.ParquetFragmentScanOptions(
+                cache_options=pa.CacheOptions(
+                    prefetch_limit=1,  # Prefetch next chunk while processing current
+                    range_size_limit=128 << 20,  # 128 MiB block size (default is 32MiB)
+                ),
+            )
+
+            # OPTIMIZATION: Use columns= directly (faster than .select_columns())
             ds = load_dataset(
-                self.repo_id, split="train", streaming=True
-            ).select_columns(["index"])
+                self.repo_id,
+                split="train",
+                streaming=True,
+                columns=["index"],
+                fragment_scan_options=fragment_scan_options,
+            )
+
             hf_indices = set()
-            for row in tqdm(ds, desc="Verifying HF dataset"):
-                hf_indices.add(row["index"])
-                total_existing += 1
+            # OPTIMIZATION: Batch iteration instead of row-by-row (~10x faster)
+            for batch in tqdm(ds.batch(batch_size=10000), desc="Verifying HF dataset"):
+                hf_indices.update(batch["index"])
+                total_existing += len(batch["index"])
 
             # Use HF indices as source of truth, but preserve local additions
             if hf_indices and not self.config.force_restart:
