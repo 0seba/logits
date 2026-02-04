@@ -640,11 +640,14 @@ class GracefulInterrupt:
     def check_and_exit(self):
         """Check if we should stop processing and exit gracefully."""
         if self.interrupted:
-            self.uploader.flush(final=True)
+            # Save unflushed data locally instead of trying to upload
+            pending_file = self.uploader.save_pending_locally()
             print(
-                f"\n✅ Saved progress. {self.uploader.total_samples_uploaded} samples uploaded."
+                f"\n✅ Saved progress. {self.uploader.total_samples_uploaded} samples uploaded to HF."
             )
-            print(f"   Run with --resume to continue from where you left off.")
+            if pending_file:
+                print(f"   Pending data saved to: {pending_file}")
+            print(f"   Run with --resume to continue (pending data will be uploaded first)")
             sys.exit(0)
 
 
