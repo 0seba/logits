@@ -78,16 +78,19 @@ Interrupt/Timeout → save_pending_locally() → .logit_extraction_cache/pending
 
 1. **Assistant Mask**: Uses `tokenizer.apply_chat_template(..., return_assistant_tokens_mask=True)` to identify which tokens are model outputs. Only these tokens have logits extracted.
 
-2. **Double Precision Computation** (L1014-1017): All probability and logsumexp computations use float64 for numerical accuracy, avoiding issues with peaked distributions where float32 would show top_logit == logsumexp.
+2. **Precision** (L1018-1026):
+   - `logsumexp` is always computed in float64 for accuracy (stored as float64)
+   - Nucleus extraction and sampling use float32 by default for performance
+   - Use `--double-precision` flag for float64 throughout (slower but more accurate)
 
-3. **Nucleus Extraction** (L1022-1056): Vectorized on GPU in double precision, no Python loops:
+3. **Nucleus Extraction** (L1030-1060): Vectorized on GPU, no Python loops:
    ```python
    sorted_probs, sorted_idx = torch.sort(probs, dim=-1, descending=True)
    cumsum_probs = torch.cumsum(sorted_probs, dim=-1)
    nucleus_mask = cumsum_probs <= config.top_p
    ```
 
-4. **Sampling from Remaining Vocab** (L1072-1086): Uses Gumbel-max trick in log-space (double precision) to sample from non-nucleus tokens proportionally to their true probabilities, avoiding underflow issues with tiny probabilities.
+4. **Sampling from Remaining Vocab** (L1076-1095): Uses Gumbel-max trick in log-space to sample from non-nucleus tokens proportionally to their true probabilities, avoiding underflow issues with tiny probabilities.
 
 5. **Quantization**: Logits quantized to uint16 per-row with min/max scaling:
    ```python
@@ -196,11 +199,18 @@ python extract_logits.py ... --max-runtime-minutes 55 --resume
 python extract_logits.py ... --upload-size-mb 100
 ```
 
+**Double Precision** (for maximum accuracy):
+```bash
+# Use float64 for nucleus/sampling (logsumexp is always float64)
+python extract_logits.py ... --double-precision
+```
+
 ### Modifying Nucleus Extraction
 
-The nucleus extraction logic is in `gpu_process_batch()` at L762-796. Key variables:
+The nucleus extraction logic is in `gpu_process_batch()` at L1030-1060. Key variables:
 - `config.top_p`: Cumulative probability threshold (default 0.98)
 - `config.top_p_max_elements`: Hard cap on nucleus size (default 100)
+- `config.double_precision`: Use float64 for nucleus/sampling (default False)
 
 ### Adding a New Output Column
 

@@ -144,6 +144,10 @@ class ExtractionConfig:
     # Additional sampled logits from remaining vocabulary
     sampled_n: int = 24
 
+    # Use double precision for nucleus/sampling (slower but more accurate)
+    # Note: logsumexp is always computed in double precision
+    double_precision: bool = False
+
     # Batch sizing based on token budget (length -> samples per batch)
     # More conservative defaults to prevent OOM on typical GPUs
     # Format: {max_seq_len: max_batch_size}
@@ -1011,10 +1015,15 @@ def gpu_process_batch(
         logits = model.lm_head(hidden_states[extract_positions])  # (N, vocab)
         metrics.num_tokens = N
 
-        # Compute logsumexp and probabilities in double precision for accuracy
+        # Compute logsumexp in double precision (always, for accuracy)
         logits_d = logits.double()
         lse = torch.logsumexp(logits_d, dim=-1)  # double precision logsumexp
-        probs = torch.exp(logits_d - lse.unsqueeze(-1))  # probs in double precision
+
+        # Working precision for nucleus/sampling (configurable for performance)
+        work_dtype = torch.float64 if config.double_precision else torch.float32
+        logits_w = logits_d if config.double_precision else logits.float()
+        lse_w = lse if config.double_precision else lse.float()
+        probs = torch.exp(logits_w - lse_w.unsqueeze(-1))
 
         # Count tokens per sample in batch
         sizes = assistant_mask.sum(dim=-1).tolist()
@@ -1046,7 +1055,7 @@ def gpu_process_batch(
         # This is much faster than variable-length extraction
         k = config.top_p_max_elements
         top_indices = sorted_idx[:, :k]  # (N, k) - original vocab indices
-        top_logits = logits_d.gather(-1, top_indices)  # (N, k) double precision
+        top_logits = logits_w.gather(-1, top_indices)  # (N, k)
 
         # Quantize nucleus logits on GPU (vectorized per-row)
         top_min = top_logits.min(dim=-1).values  # (N,)
@@ -1071,19 +1080,19 @@ def gpu_process_batch(
 
         # Log-space sampling using Gumbel-max trick (avoids probability underflow)
         # This samples proportionally to true probabilities even when they're tiny
-        log_probs = logits_d - lse.unsqueeze(-1)  # log(p_i) in double precision
+        log_probs = logits_w - lse_w.unsqueeze(-1)  # log(p_i)
         log_probs[nucleus_mask_vocab] = float('-inf')  # exclude nucleus tokens
 
         # Gumbel-max trick: argmax(log_prob + Gumbel) ~ Categorical(prob)
         # For top-k sampling: topk(log_prob + Gumbel) gives k samples without replacement
-        uniform = torch.rand(N, vocab_size, device=device, dtype=torch.float64)
+        uniform = torch.rand(N, vocab_size, device=device, dtype=work_dtype)
         uniform = uniform.clamp(min=1e-10, max=1 - 1e-10)  # avoid log(0)
         gumbel = -torch.log(-torch.log(uniform))  # Gumbel(0, 1) samples
         perturbed = log_probs + gumbel
 
         # Top-k gives k samples weighted by probability (no uniform fallback needed)
         _, sampled_idx = torch.topk(perturbed, config.sampled_n, dim=-1)
-        sampled_logits = logits_d.gather(-1, sampled_idx)  # double precision
+        sampled_logits = logits_w.gather(-1, sampled_idx)
 
         # Quantize sampled logits on GPU
         samp_min = sampled_logits.min(dim=-1).values
@@ -1679,6 +1688,11 @@ def parse_args():
         default=24,
         help="Number of additional logits to sample from remaining vocab",
     )
+    parser.add_argument(
+        "--double-precision",
+        action="store_true",
+        help="Use float64 for nucleus/sampling (slower but more accurate). logsumexp is always float64.",
+    )
 
     # Batch sizing - simple options
     parser.add_argument(
@@ -1865,6 +1879,7 @@ def main():
         top_p=args.top_p,
         top_p_max_elements=args.top_p_max,
         sampled_n=args.sampled_n,
+        double_precision=args.double_precision,
         batch_budget_thresholds=batch_thresholds
         or {8192: 1, 4096: 1, 2048: 2, 1024: 4, 512: 8, 256: 16},
         upload_every_n_samples=args.upload_every,
