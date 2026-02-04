@@ -231,6 +231,11 @@ class StreamingHFUploader:
         self.processed_indices: set[int] = set()
         self.buffer_size_bytes = 0  # Track buffer size for size-based flushing
 
+        # Async upload support
+        self.upload_executor = ThreadPoolExecutor(max_workers=1)
+        self.pending_upload: Optional[tuple] = None  # (future, num_samples, filename)
+        self._upload_lock = threading.Lock()
+
         # Ensure cache dir exists
         os.makedirs(config.cache_dir, exist_ok=True)
 
@@ -328,15 +333,8 @@ class StreamingHFUploader:
         buf.seek(0)
         return buf
 
-    def flush(self, final: bool = False):
-        """Upload buffered samples as a Parquet file to HuggingFace."""
-        if not self.buffer:
-            return
-
-        buf = self._buffer_to_parquet_bytes()
-        buffer_size_mb = self.buffer_size_bytes / (1024 * 1024)
-        filename = f"data/part-{self.part_number:05d}.parquet"
-
+    def _do_upload(self, buf: io.BytesIO, filename: str, num_samples: int, buffer_size_mb: float) -> bool:
+        """Perform the actual upload (runs in background thread)."""
         try:
             self.api.upload_file(
                 path_or_fileobj=buf,
@@ -344,11 +342,13 @@ class StreamingHFUploader:
                 repo_id=self.repo_id,
                 repo_type="dataset",
             )
-            self.total_samples_uploaded += len(self.buffer)
+            with self._upload_lock:
+                self.total_samples_uploaded += num_samples
             print(
-                f"\n📤 Uploaded {filename} ({len(self.buffer)} samples, "
+                f"\n📤 Uploaded {filename} ({num_samples} samples, "
                 f"{buffer_size_mb:.1f}MB, total: {self.total_samples_uploaded})"
             )
+            return True
         except Exception as e:
             print(f"\n⚠️ Upload failed for {filename}: {e}")
             # Save locally as backup
@@ -359,14 +359,66 @@ class StreamingHFUploader:
                 buf.seek(0)
                 f.write(buf.read())
             print(f"   Saved backup to {backup_path}")
+            return False
 
+    def _wait_for_pending_upload(self):
+        """Wait for any pending upload to complete."""
+        if self.pending_upload is not None:
+            future, num_samples, filename = self.pending_upload
+            try:
+                future.result()  # Block until upload completes
+            except Exception as e:
+                print(f"\n⚠️ Pending upload error: {e}")
+            self.pending_upload = None
+            self._save_checkpoint()
+
+    def flush(self, final: bool = False):
+        """Upload buffered samples as a Parquet file to HuggingFace (async unless final)."""
+        # Wait for any previous upload to complete first
+        self._wait_for_pending_upload()
+
+        if not self.buffer:
+            return
+
+        buf = self._buffer_to_parquet_bytes()
+        buffer_size_mb = self.buffer_size_bytes / (1024 * 1024)
+        filename = f"data/part-{self.part_number:05d}.parquet"
+        num_samples = len(self.buffer)
+
+        # Track indices before clearing buffer
+        for sample in self.buffer:
+            self.processed_indices.add(int(sample["index"]))
+
+        # Clear buffer immediately (data is in buf now)
         self.buffer = []
         self.buffer_size_bytes = 0
         self.part_number += 1
-        self._save_checkpoint()
+
+        if final:
+            # Synchronous upload for final flush
+            self._do_upload(buf, filename, num_samples, buffer_size_mb)
+            self._save_checkpoint()
+        else:
+            # Async upload - submit to executor and continue processing
+            future = self.upload_executor.submit(
+                self._do_upload, buf, filename, num_samples, buffer_size_mb
+            )
+            self.pending_upload = (future, num_samples, filename)
+
+    def is_uploading(self) -> bool:
+        """Check if an upload is currently in progress."""
+        return self.pending_upload is not None
+
+    def shutdown(self):
+        """Shutdown the uploader, waiting for pending uploads."""
+        self._wait_for_pending_upload()
+        self.upload_executor.shutdown(wait=True)
 
     def save_pending_locally(self):
         """Save unflushed buffer locally for later upload (used on timed shutdown)."""
+        # Wait for any in-flight upload to complete first
+        self._wait_for_pending_upload()
+
         if not self.buffer:
             return None
 
@@ -1465,6 +1517,7 @@ def run_extraction(config: ExtractionConfig, verify_mask: bool = False):
     # Process loop with async CPU post-processing
     print(f"\n🚀 Starting extraction ({len(loader)} batches)...")
     print("   GPU/CPU pipelining enabled for maximum throughput")
+    print("   Async HuggingFace uploads enabled (⬆ in progress bar = uploading)")
     if config.upload_size_mb:
         print(f"   Size-based upload: every {config.upload_size_mb:.1f} MB")
 
@@ -1509,11 +1562,14 @@ def run_extraction(config: ExtractionConfig, verify_mask: bool = False):
                 "tok/s": f"{avg_tok_per_sec:.0f}",
             }
 
-            # Show buffer size (in MB if size-based, else count)
+            # Show buffer size (in MB if size-based, else count) and upload status
             if config.upload_size_mb:
-                postfix["buf"] = f"{uploader.get_buffer_size_mb():.1f}MB"
+                buf_str = f"{uploader.get_buffer_size_mb():.1f}MB"
             else:
-                postfix["buf"] = len(uploader.buffer)
+                buf_str = str(len(uploader.buffer))
+            if uploader.is_uploading():
+                buf_str += "⬆"  # Indicate upload in progress
+            postfix["buf"] = buf_str
 
             # Show remaining time if timed shutdown is enabled
             remaining = timed_shutdown.get_remaining_minutes()
@@ -1559,10 +1615,12 @@ def run_extraction(config: ExtractionConfig, verify_mask: bool = False):
     # Handle timed shutdown
     if timed_out:
         timed_shutdown.shutdown_gracefully()
+        uploader.shutdown()
         return
 
-    # Final flush
+    # Final flush (synchronous)
     uploader.flush(final=True)
+    uploader.shutdown()
 
     print(f"\n✅ Extraction complete! Total samples: {uploader.total_samples_uploaded}")
     print(f"📁 Dataset: https://huggingface.co/datasets/{config.hf_output_repo}")
