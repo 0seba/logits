@@ -32,6 +32,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 from concurrent.futures import ThreadPoolExecutor
 import argparse
+import glob
 import io
 import json
 import os
@@ -203,6 +204,14 @@ class ExtractionConfig:
     # Sampling Method
     random_sample: bool = False
 
+    # Size-based upload: upload when buffer reaches this size (MB)
+    # If None, uses upload_every_n_samples instead
+    upload_size_mb: Optional[float] = None
+
+    # Timed shutdown: stop after this many minutes and save unflushed data locally
+    # On next run with --resume, pending local files will be uploaded first
+    max_runtime_minutes: Optional[float] = None
+
 
 # =============================================================================
 # Streaming HuggingFace Upload
@@ -220,9 +229,13 @@ class StreamingHFUploader:
         self.part_number = 0
         self.total_samples_uploaded = 0
         self.processed_indices: set[int] = set()
+        self.buffer_size_bytes = 0  # Track buffer size for size-based flushing
 
         # Ensure cache dir exists
         os.makedirs(config.cache_dir, exist_ok=True)
+
+        # Pending directory for unflushed data saved on timed shutdown
+        self.pending_dir = os.path.join(config.cache_dir, "pending")
 
         # Create repo if it doesn't exist
         try:
@@ -237,25 +250,40 @@ class StreamingHFUploader:
         """Add a processed sample to the buffer."""
         self.buffer.append(sample)
         self.processed_indices.add(int(sample["index"]))
+        # Estimate sample size for size-based flushing
+        self.buffer_size_bytes += self._estimate_sample_size(sample)
+
+    def _estimate_sample_size(self, sample: dict) -> int:
+        """Estimate the size of a sample in bytes."""
+        size = 0
+        for key, value in sample.items():
+            if isinstance(value, np.ndarray):
+                size += value.nbytes
+            elif isinstance(value, bytes):
+                size += len(value)
+            elif isinstance(value, list):
+                # Estimate list of floats/ints
+                size += len(value) * 4
+            else:
+                size += 8  # Rough estimate for scalars
+        return size
 
     def should_flush(self) -> bool:
-        """Check if buffer should be flushed."""
+        """Check if buffer should be flushed based on sample count or size."""
+        # Size-based flush takes precedence if configured
+        if self.config.upload_size_mb is not None:
+            size_mb = self.buffer_size_bytes / (1024 * 1024)
+            return size_mb >= self.config.upload_size_mb
+        # Fall back to sample count
         return len(self.buffer) >= self.config.upload_every_n_samples
 
-    def flush(self, final: bool = False):
-        """Upload buffered samples as a Parquet file."""
-        if not self.buffer:
-            return
+    def get_buffer_size_mb(self) -> float:
+        """Get current buffer size in MB."""
+        return self.buffer_size_bytes / (1024 * 1024)
 
-        # Convert to DataFrame
-        df = pd.DataFrame(self.buffer)
-
-        # No longer converting numpy arrays to lists - PyArrow handles list of numpy arrays fine
-        # and it's much more memory efficient.
-
-        # Define explicit schema with efficient types and packed indices
-        # Note: 'top_indices' and 'sampled_indices' are now split into low (uint16) and high (packed bytes)
-        schema = pa.schema(
+    def _get_schema(self) -> pa.Schema:
+        """Get the PyArrow schema for parquet files."""
+        return pa.schema(
             [
                 ("index", pa.int32()),
                 ("num_tokens", pa.int32()),
@@ -276,27 +304,37 @@ class StreamingHFUploader:
             ]
         )
 
+    def _buffer_to_parquet_bytes(self) -> io.BytesIO:
+        """Convert current buffer to parquet bytes."""
+        df = pd.DataFrame(self.buffer)
+        schema = self._get_schema()
+
         if self.part_number == 0:
             print("\n📊 PyArrow Schema:")
             print(schema)
 
-        # Convert to PyArrow with explicit schema
         try:
             table = pa.Table.from_pandas(df, schema=schema)
         except Exception as e:
             print(f"\n❌ Error converting to PyArrow table: {e}")
-            # Debug: print first row types
             if len(self.buffer) > 0:
                 print("First row types:")
                 for k, v in self.buffer[0].items():
                     print(f"  {k}: {type(v)}")
             raise e
 
-        # Write to bytes
         buf = io.BytesIO()
         pq.write_table(table, buf)
         buf.seek(0)
+        return buf
 
+    def flush(self, final: bool = False):
+        """Upload buffered samples as a Parquet file to HuggingFace."""
+        if not self.buffer:
+            return
+
+        buf = self._buffer_to_parquet_bytes()
+        buffer_size_mb = self.buffer_size_bytes / (1024 * 1024)
         filename = f"data/part-{self.part_number:05d}.parquet"
 
         try:
@@ -309,7 +347,7 @@ class StreamingHFUploader:
             self.total_samples_uploaded += len(self.buffer)
             print(
                 f"\n📤 Uploaded {filename} ({len(self.buffer)} samples, "
-                f"total: {self.total_samples_uploaded})"
+                f"{buffer_size_mb:.1f}MB, total: {self.total_samples_uploaded})"
             )
         except Exception as e:
             print(f"\n⚠️ Upload failed for {filename}: {e}")
@@ -323,10 +361,104 @@ class StreamingHFUploader:
             print(f"   Saved backup to {backup_path}")
 
         self.buffer = []
+        self.buffer_size_bytes = 0
         self.part_number += 1
-
-        # Save local and remote checkpoint
         self._save_checkpoint()
+
+    def save_pending_locally(self):
+        """Save unflushed buffer locally for later upload (used on timed shutdown)."""
+        if not self.buffer:
+            return None
+
+        os.makedirs(self.pending_dir, exist_ok=True)
+        buf = self._buffer_to_parquet_bytes()
+        buffer_size_mb = self.buffer_size_bytes / (1024 * 1024)
+
+        # Save with timestamp to avoid conflicts
+        pending_file = os.path.join(self.pending_dir, f"pending-{self.part_number:05d}.parquet")
+        with open(pending_file, "wb") as f:
+            f.write(buf.read())
+
+        print(
+            f"\n💾 Saved pending data locally: {pending_file} "
+            f"({len(self.buffer)} samples, {buffer_size_mb:.1f}MB)"
+        )
+
+        # Save checkpoint with pending info
+        self._save_checkpoint()
+
+        self.buffer = []
+        self.buffer_size_bytes = 0
+        return pending_file
+
+    def load_pending_into_buffer(self) -> int:
+        """Load any pending local files back into the buffer for merging with new data.
+
+        Pending files are deleted after being loaded. The data will be uploaded
+        together with new samples when the buffer reaches the upload threshold.
+
+        Returns:
+            Number of samples loaded from pending files.
+        """
+        if not os.path.exists(self.pending_dir):
+            return 0
+
+        pending_files = sorted(glob.glob(os.path.join(self.pending_dir, "*.parquet")))
+        if not pending_files:
+            return 0
+
+        print(f"\n📂 Loading {len(pending_files)} pending local file(s) into buffer...")
+        total_loaded = 0
+
+        for pending_file in pending_files:
+            try:
+                # Read the parquet file
+                table = pq.read_table(pending_file)
+                df = table.to_pandas()
+
+                # Convert each row back to the sample dict format
+                for _, row in df.iterrows():
+                    sample = {
+                        "index": row["index"],
+                        "num_tokens": row["num_tokens"],
+                        "top_indices_low": row["top_indices_low"],
+                        "top_indices_high": row["top_indices_high"],
+                        "top_logits_quantized": row["top_logits_quantized"],
+                        "top_counts": row["top_counts"],
+                        "top_min": row["top_min"],
+                        "top_max": row["top_max"],
+                        "sampled_indices_low": row["sampled_indices_low"],
+                        "sampled_indices_high": row["sampled_indices_high"],
+                        "sampled_logits_quantized": row["sampled_logits_quantized"],
+                        "sampled_min": row["sampled_min"],
+                        "sampled_max": row["sampled_max"],
+                        "logsumexp": row["logsumexp"],
+                    }
+                    self.buffer.append(sample)
+                    self.processed_indices.add(int(sample["index"]))
+                    self.buffer_size_bytes += self._estimate_sample_size(sample)
+
+                total_loaded += len(df)
+
+                # Delete local file after loading
+                os.remove(pending_file)
+                print(f"   ✅ Loaded {pending_file} ({len(df)} samples)")
+
+            except Exception as e:
+                print(f"   ⚠️ Failed to load {pending_file}: {e}")
+                print(f"      File will remain for manual inspection")
+
+        # Clean up empty pending directory
+        if os.path.exists(self.pending_dir) and not os.listdir(self.pending_dir):
+            os.rmdir(self.pending_dir)
+
+        if total_loaded > 0:
+            print(
+                f"   📂 Loaded {total_loaded} samples into buffer "
+                f"({self.get_buffer_size_mb():.1f}MB)"
+            )
+
+        return total_loaded
 
     def _save_checkpoint(self):
         """Save checkpoint metadata locally and to HuggingFace."""
@@ -363,6 +495,7 @@ class StreamingHFUploader:
     def get_resume_info(self) -> tuple[int, set[int], int]:
         """
         Get resume information from local checkpoint and HuggingFace dataset.
+        Also loads any pending local files from a previous timed shutdown into the buffer.
 
         Returns:
             (part_number, set of processed indices, total existing samples)
@@ -385,7 +518,10 @@ class StreamingHFUploader:
             except Exception as e:
                 print(f"Note: Could not load local checkpoint: {e}")
 
-        # Then, verify against HuggingFace dataset
+        # Load any pending local files into buffer (will be uploaded with next chunk)
+        self.load_pending_into_buffer()
+
+        # Verify against HuggingFace dataset
         try:
             # OPTIMIZATION: Only fetch index column
             ds = load_dataset(
@@ -443,6 +579,60 @@ class GracefulInterrupt:
             )
             print(f"   Run with --resume to continue from where you left off.")
             sys.exit(0)
+
+
+class TimedShutdown:
+    """Handle automatic shutdown after a specified runtime."""
+
+    def __init__(
+        self,
+        uploader: StreamingHFUploader,
+        max_runtime_minutes: Optional[float] = None,
+    ):
+        self.uploader = uploader
+        self.max_runtime_minutes = max_runtime_minutes
+        self.start_time = time.time()
+        self.should_stop = False
+
+        if max_runtime_minutes:
+            print(f"⏱️  Timed shutdown enabled: will stop after {max_runtime_minutes:.1f} minutes")
+
+    def check_timeout(self) -> bool:
+        """Check if we've exceeded the time limit. Returns True if should stop."""
+        if self.max_runtime_minutes is None:
+            return False
+
+        elapsed_minutes = (time.time() - self.start_time) / 60
+        if elapsed_minutes >= self.max_runtime_minutes:
+            self.should_stop = True
+            return True
+        return False
+
+    def get_elapsed_minutes(self) -> float:
+        """Get elapsed time in minutes."""
+        return (time.time() - self.start_time) / 60
+
+    def get_remaining_minutes(self) -> Optional[float]:
+        """Get remaining time in minutes, or None if no limit."""
+        if self.max_runtime_minutes is None:
+            return None
+        elapsed = self.get_elapsed_minutes()
+        return max(0, self.max_runtime_minutes - elapsed)
+
+    def shutdown_gracefully(self):
+        """Perform graceful shutdown, saving unflushed data locally."""
+        print(f"\n\n⏱️  Time limit reached ({self.max_runtime_minutes:.1f} minutes).")
+        print("   Saving unflushed data locally...")
+
+        # Save any unflushed data to pending directory
+        pending_file = self.uploader.save_pending_locally()
+
+        print(
+            f"\n✅ Saved progress. {self.uploader.total_samples_uploaded} samples uploaded to HF."
+        )
+        if pending_file:
+            print(f"   Pending data saved to: {pending_file}")
+        print(f"   Run with --resume to continue (pending data will be uploaded first)")
 
 
 # =============================================================================
@@ -1188,6 +1378,9 @@ def run_extraction(config: ExtractionConfig, verify_mask: bool = False):
     # Set up graceful interrupt handler
     interrupt_handler = GracefulInterrupt(uploader)
 
+    # Set up timed shutdown handler
+    timed_shutdown = TimedShutdown(uploader, config.max_runtime_minutes)
+
     # Load model and tokenizer
     print(f"\n🤖 Loading model: {config.model_id}")
     dtype_map = {
@@ -1272,6 +1465,8 @@ def run_extraction(config: ExtractionConfig, verify_mask: bool = False):
     # Process loop with async CPU post-processing
     print(f"\n🚀 Starting extraction ({len(loader)} batches)...")
     print("   GPU/CPU pipelining enabled for maximum throughput")
+    if config.upload_size_mb:
+        print(f"   Size-based upload: every {config.upload_size_mb:.1f} MB")
 
     async_processor = AsyncPostProcessor(max_workers=2)
     pbar = tqdm(total=len(df), desc="Extracting logits")
@@ -1281,10 +1476,16 @@ def run_extraction(config: ExtractionConfig, verify_mask: bool = False):
     avg_postprocess_ms = 0.0
     avg_tok_per_sec = 0.0
     ema_alpha = 0.1  # Exponential moving average smoothing
+    timed_out = False
 
     try:
         for batch_idx, (batch, indexes) in enumerate(loader):
             interrupt_handler.check_and_exit()
+
+            # Check for timed shutdown
+            if timed_shutdown.check_timeout():
+                timed_out = True
+                break
 
             # GPU processing for current batch
             gpu_result, gpu_metrics = gpu_process_batch(
@@ -1299,17 +1500,28 @@ def run_extraction(config: ExtractionConfig, verify_mask: bool = False):
             # Update progress bar immediately after GPU returns (overlaps with async CPU work)
             batch_size = batch["input_ids"].size(0)
             num_tokens = gpu_metrics.num_tokens
+
+            # Build postfix dict
+            postfix = {
+                "batch": f"{batch_size}x{num_tokens}tok",
+                "gpu": f"{gpu_metrics.model_time_ms:.0f}ms",
+                "cpu": f"{avg_postprocess_ms:.0f}ms",
+                "tok/s": f"{avg_tok_per_sec:.0f}",
+            }
+
+            # Show buffer size (in MB if size-based, else count)
+            if config.upload_size_mb:
+                postfix["buf"] = f"{uploader.get_buffer_size_mb():.1f}MB"
+            else:
+                postfix["buf"] = len(uploader.buffer)
+
+            # Show remaining time if timed shutdown is enabled
+            remaining = timed_shutdown.get_remaining_minutes()
+            if remaining is not None:
+                postfix["left"] = f"{remaining:.0f}m"
+
             pbar.update(batch_size)
-            pbar.set_postfix(
-                {
-                    "batch": f"{batch_size}x{num_tokens}tok",
-                    "gpu": f"{gpu_metrics.model_time_ms:.0f}ms",
-                    "cpu": f"{avg_postprocess_ms:.0f}ms",
-                    "tok/s": f"{avg_tok_per_sec:.0f}",
-                    "buf": len(uploader.buffer),
-                },
-                refresh=True
-            )
+            pbar.set_postfix(postfix, refresh=True)
 
             if gpu_result is not None:
                 # Submit for async CPU post-processing (returns previous batch results)
@@ -1343,6 +1555,11 @@ def run_extraction(config: ExtractionConfig, verify_mask: bool = False):
     finally:
         async_processor.shutdown()
         pbar.close()
+
+    # Handle timed shutdown
+    if timed_out:
+        timed_shutdown.shutdown_gracefully()
+        return
 
     # Final flush
     uploader.flush(final=True)
@@ -1414,6 +1631,20 @@ def parse_args():
     # Upload options
     parser.add_argument(
         "--upload-every", type=int, default=500, help="Upload to HF every N samples"
+    )
+    parser.add_argument(
+        "--upload-size-mb",
+        type=float,
+        default=None,
+        help="Upload when buffer reaches this size in MB (overrides --upload-every)",
+    )
+
+    # Timed shutdown
+    parser.add_argument(
+        "--max-runtime-minutes",
+        type=float,
+        default=None,
+        help="Stop after this many minutes and save unflushed data locally (useful for time-limited servers). On next --resume, pending data is uploaded first.",
     )
 
     # Model loading
@@ -1586,6 +1817,9 @@ def main():
         cache_dir=args.cache_dir,
         chat_template_file=args.chat_template,
         random_sample=args.random_sample,
+        # Size-based upload and timed shutdown
+        upload_size_mb=args.upload_size_mb,
+        max_runtime_minutes=args.max_runtime_minutes,
     )
 
     run_extraction(config, verify_mask=args.verify_mask)
